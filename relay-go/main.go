@@ -301,6 +301,41 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 		"tenant":   tenantID,
 	})
 
+	// Configure WebSocket keepalive for Cloud Run
+	// Cloud Run times out idle connections, so we need active ping/pong
+	const (
+		pongWait   = 60 * time.Second  // Time to wait for pong before assuming dead
+		pingPeriod = 30 * time.Second  // How often to send pings (must be < pongWait)
+	)
+
+	// Set initial read deadline
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+
+	// Handle pong messages - refresh the read deadline
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	// Start a goroutine to send periodic pings
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+					log.Printf("[RELAY] Agent %s ping failed: %v", agentID, err)
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	defer close(done)
+
 	// Read loop - handle responses and pings
 	for {
 		var msg map[string]json.RawMessage
@@ -310,6 +345,9 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 			}
 			break
 		}
+
+		// Refresh read deadline on any message
+		conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		msgType := ""
 		if t, ok := msg["type"]; ok {
