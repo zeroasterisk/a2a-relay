@@ -1,224 +1,148 @@
 # A2A Relay
 
-A relay service for A2A (Agent2Agent) protocol that enables agents without public URLs to participate in the A2A ecosystem.
+> ⚠️ **Beta** — Tested and working, but API may change. Production use at your own risk.
 
-## The Problem
+A relay service for [A2A Protocol](https://a2a-protocol.org) that enables agents without public URLs to participate in agent-to-agent communication.
 
-A2A assumes HTTP endpoints, but many agents don't have public URLs:
-- Behind NAT (home networks, corporate firewalls)
-- Laptops that sleep/wake
+## Why?
+
+A2A assumes HTTP endpoints, but many agents can't expose public URLs:
+- Behind NAT/firewalls
+- Laptops that sleep
 - Privacy-conscious deployments
 
-## The Solution
-
-Agents connect **outbound** to the relay via WebSocket. Clients send A2A requests to the relay's HTTP API, which forwards them to the connected agent.
+**Solution:** Agents connect *outbound* to the relay. Clients send requests to the relay, which forwards to connected agents.
 
 ```
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│  A2A Client  │  HTTP   │   A2A Relay  │   WS    │    Agent     │
-│              │────────►│              │◄────────│  (no public  │
-│              │◄────────│              │────────►│     URL)     │
-└──────────────┘         └──────────────┘         └──────────────┘
+Client ──HTTP──► Relay ◄──WebSocket── Agent (no public URL)
 ```
+
+## Quick Start
+
+### Deploy the Relay
+
+```bash
+cd relay-go
+go build -o a2a-relay .
+./a2a-relay --port 8080 --secret "your-32-char-jwt-secret"
+```
+
+Or use Docker:
+```bash
+docker run -p 8080:8080 -e JWT_SECRET="your-secret" ghcr.io/zeroasterisk/a2a-relay
+```
+
+### Connect an Agent
+
+```javascript
+const ws = new WebSocket('wss://your-relay.com/agent');
+ws.send(JSON.stringify({
+  type: 'auth',
+  token: createJWT({ tenant: 'default', agent_id: 'my-agent', role: 'agent' }),
+  tenant: 'default',
+  agent_id: 'my-agent',
+  agent_card: { name: 'My Agent', ... }
+}));
+```
+
+### Send a Message (Client)
+
+```bash
+curl -X POST https://your-relay.com/t/default/a2a/my-agent/message/send \
+  -H "Authorization: Bearer $CLIENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message": {"role": "user", "parts": [{"text": "Hello!"}]}}'
+```
+
+## OpenClaw Integration
+
+The easiest way to use A2A Relay is with [OpenClaw](https://openclaw.ai):
+
+```json
+{
+  "channels": {
+    "a2a": {
+      "enabled": true,
+      "accounts": {
+        "default": {
+          "relayUrl": "wss://your-relay.com/agent",
+          "relaySecret": "your-jwt-secret",
+          "agentId": "my-agent"
+        }
+      }
+    }
+  }
+}
+```
+
+See [openclaw-a2a plugin](https://github.com/zeroasterisk/zaf/tree/main/plugins/a2a) for details.
 
 ## Architecture
-
-### Multi-tenant Auth Model
 
 ```
 Relay
 ├── Tenant: acme-corp
-│   ├── Agent: zaf (connected via WS)
-│   ├── Agent: research-bot (connected via WS)
-│   └── Clients: [user1, user2, ...]
-├── Tenant: personal
-│   ├── Agent: my-assistant (connected via WS)
-│   └── Clients: [me]
-└── Tenant: public
-    └── Agent: demo-bot (connected via WS)
+│   ├── Agent: assistant (WebSocket)
+│   └── Agent: researcher (WebSocket)
+└── Tenant: personal
+    └── Agent: my-bot (WebSocket)
 ```
 
-### Auth Flows
+### Auth Model
 
-**Agent → Relay (WebSocket)**
-```
-1. Agent connects: wss://relay.example.com/agent
-2. Agent sends: { "auth": { "tenant": "acme", "agent_id": "zaf", "token": "..." } }
-3. Relay validates token, registers agent in tenant
-4. Agent receives A2A requests, sends responses
+| Token | Who | Allows |
+|-------|-----|--------|
+| Agent | Agent process | Register & receive requests |
+| Client | End users | Send requests to agents |
+
+Tokens are JWTs signed with the relay's secret.
+
+## API
+
+### Agent WebSocket (`/agent`)
+
+```json
+// Auth
+{ "type": "auth", "token": "...", "tenant": "...", "agent_id": "...", "agent_card": {...} }
+
+// Receive request
+{ "type": "a2a.request", "payload": { "id": "...", "params": {...} } }
+
+// Send response
+{ "type": "a2a.response", "payload": { "id": "...", "result": {...} } }
 ```
 
-**Client → Relay (HTTP)**
-```
-1. Client calls: POST /t/{tenant}/a2a/{agent_id}/message/send
-2. Headers: Authorization: Bearer <client_token>
-3. Relay validates client belongs to tenant
-4. Relay forwards to agent, returns response
-```
+### Client HTTP (`/t/{tenant}/a2a/{agent}`)
 
-### Token Types
-
-| Token Type | Who Has It | What It Allows |
-|------------|-----------|----------------|
-| Agent Token | Agent | Register as specific agent in tenant |
-| Client Token | End users | Send A2A requests to agents in tenant |
-| Admin Token | Tenant admin | Manage agents, create tokens |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/.well-known/agent.json` | Agent card |
+| POST | `/message/send` | Send message |
+| GET | `/tasks/{id}` | Get task |
+| GET | `/tasks` | List tasks |
 
 ## Implementations
 
-This repo will contain multiple implementations to evaluate tradeoffs:
+| Directory | Language | Status |
+|-----------|----------|--------|
+| `/relay-go` | Go | ✅ Production-ready |
+| `/relay-elixir` | Elixir | 🚧 WIP |
+| `/relay-restate` | TypeScript | 🚧 WIP |
 
-### `/relay-elixir` - Phoenix/Elixir
-
-**Best for:** High concurrency, real-time, mailbox queuing
-
-- Phoenix Channels for WebSocket
-- Built-in PubSub (no Redis needed)
-- Millions of concurrent connections
-- Erlang's actor model = perfect for agent mailboxes
-
-### `/relay-go` - Go
-
-**Best for:** Simple deployment, A2A SDK available
-
-- Uses official A2A Go SDK
-- Single binary
-- Good concurrency with goroutines
-- Simpler than Elixir for many devs
-
-### `/relay-restate` - Restate
-
-**Best for:** Durable execution, guaranteed delivery
-
-- Messages survive relay restart
-- Automatic retries with backoff
-- Built-in state management
-- Higher complexity
-
-## API Specification
-
-### Agent WebSocket API
-
-**Endpoint:** `wss://relay.example.com/agent`
-
-**Auth Message:**
-```json
-{
-  "type": "auth",
-  "tenant": "acme-corp",
-  "agent_id": "zaf",
-  "token": "agent-token-...",
-  "agent_card": { ... }
-}
-```
-
-**Receive Request:**
-```json
-{
-  "type": "a2a.request",
-  "id": "req-123",
-  "method": "message/send",
-  "params": { ... }
-}
-```
-
-**Send Response:**
-```json
-{
-  "type": "a2a.response",
-  "id": "req-123",
-  "result": { ... }
-}
-```
-
-### Client HTTP API
-
-**Base URL:** `https://relay.example.com/t/{tenant}/a2a/{agent_id}`
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/.well-known/agent.json` | Get agent card |
-| POST | `/message/send` | Send message |
-| POST | `/message/stream` | Send with SSE streaming |
-| GET | `/tasks/{id}` | Get task |
-| GET | `/tasks` | List tasks |
-| POST | `/tasks/{id}/cancel` | Cancel task |
-
-### Admin HTTP API
-
-**Base URL:** `https://relay.example.com/admin/t/{tenant}`
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/agents` | List registered agents |
-| POST | `/agents/{id}/token` | Generate agent token |
-| DELETE | `/agents/{id}/token` | Revoke agent token |
-| GET | `/clients` | List clients |
-| POST | `/clients/{id}/token` | Generate client token |
-
-## URL Scheme
-
-Agents and clients reference relay-hosted agents with:
-
-```
-a2a-relay://{relay-host}/t/{tenant}/{agent_id}
-```
-
-Example: `a2a-relay://relay.openclaw.ai/t/personal/zaf`
-
-## Configuration
-
-```yaml
-# relay.yaml
-server:
-  host: 0.0.0.0
-  port: 8080
-  
-auth:
-  # JWT signing key
-  secret: "${RELAY_AUTH_SECRET}"
-  
-  # Token expiry
-  agent_token_ttl: 30d
-  client_token_ttl: 7d
-
-tenants:
-  # Pre-configured tenants (optional)
-  - id: personal
-    name: "Personal"
-    admin_email: "alan@example.com"
-
-storage:
-  # Where to store tenant/token data
-  type: sqlite  # or postgres, memory
-  path: ./relay.db
-
-limits:
-  # Per-tenant limits
-  max_agents_per_tenant: 10
-  max_clients_per_tenant: 100
-  max_pending_requests: 1000
-  request_timeout_ms: 30000
-```
-
-## Development
+## Config
 
 ```bash
-# Elixir version
-cd relay-elixir
-mix deps.get
-mix phx.server
-
-# Go version
-cd relay-go
-go run .
-
-# Restate version
-cd relay-restate
-npm install
-npx restate-server &
-npm run dev
+# Environment variables
+JWT_SECRET=your-32-char-minimum-secret
+PORT=8080
+BIND=0.0.0.0
 ```
+
+## Links
+
+- [A2A Protocol](https://a2a-protocol.org)
+- [OpenClaw A2A Plugin](https://github.com/zeroasterisk/zaf/tree/main/plugins/a2a)
+- [A2A OPT Extension](https://github.com/zeroasterisk/a2a-opt)
 
 ## License
 
