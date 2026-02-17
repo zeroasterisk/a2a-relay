@@ -75,7 +75,7 @@ The easiest way to use A2A Relay is with [OpenClaw](https://openclaw.ai):
 }
 ```
 
-See [openclaw-a2a plugin](https://github.com/zeroasterisk/zaf/tree/main/plugins/a2a) for details.
+See [openclaw-a2a plugin](https://github.com/zeroasterisk/openclaw-a2a) for details.
 
 ## Architecture
 
@@ -141,7 +141,7 @@ BIND=0.0.0.0
 ## Links
 
 - [A2A Protocol](https://a2a-protocol.org)
-- [OpenClaw A2A Plugin](https://github.com/zeroasterisk/zaf/tree/main/plugins/a2a)
+- [OpenClaw A2A Plugin](https://github.com/zeroasterisk/openclaw-a2a)
 - [A2A OPT Extension](https://github.com/zeroasterisk/a2a-opt)
 
 ## License
