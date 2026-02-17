@@ -30,14 +30,17 @@ var (
 
 // AgentCard represents an A2A agent's metadata
 type AgentCard struct {
-	Name               string            `json:"name"`
-	Description        string            `json:"description,omitempty"`
-	URL                string            `json:"url"`
-	Version            string            `json:"version"`
-	Capabilities       AgentCapabilities `json:"capabilities"`
-	Skills             []AgentSkill      `json:"skills,omitempty"`
-	DefaultInputModes  []string          `json:"defaultInputModes,omitempty"`
-	DefaultOutputModes []string          `json:"defaultOutputModes,omitempty"`
+	ID                         string            `json:"id,omitempty"`
+	Name                       string            `json:"name"`
+	Description                string            `json:"description,omitempty"`
+	URL                        string            `json:"url"`
+	Version                    string            `json:"version"`
+	ProtocolVersion            string            `json:"protocolVersion,omitempty"`
+	SupportedProtocolVersions  []string          `json:"supportedProtocolVersions,omitempty"`
+	Capabilities               AgentCapabilities `json:"capabilities"`
+	Skills                     []AgentSkill      `json:"skills,omitempty"`
+	DefaultInputModes          []string          `json:"defaultInputModes,omitempty"`
+	DefaultOutputModes         []string          `json:"defaultOutputModes,omitempty"`
 }
 
 type AgentCapabilities struct {
@@ -46,9 +49,32 @@ type AgentCapabilities struct {
 }
 
 type AgentSkill struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+}
+
+// JSON-RPC 2.0 types
+
+type JSONRPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type JSONRPCResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *JSONRPCError   `json:"error,omitempty"`
+}
+
+type JSONRPCError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
 }
 
 // ConnectedAgent represents an agent connected via WebSocket
@@ -433,6 +459,142 @@ func (r *Relay) handleA2ARequest(w http.ResponseWriter, req *http.Request) {
 	json.NewEncoder(w).Encode(resp.Result)
 }
 
+// jsonrpcMethodMap maps JSON-RPC method names to internal A2A methods
+var jsonrpcMethodMap = map[string]string{
+	"SendMessage": "message/send",
+	"GetTask":     "tasks/get",
+	"ListTasks":   "tasks/list",
+	"CancelTask":  "tasks/cancel",
+}
+
+func jsonrpcError(id interface{}, code int, message string) *JSONRPCResponse {
+	return &JSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error:   &JSONRPCError{Code: code, Message: message},
+	}
+}
+
+func (r *Relay) handleJSONRPC(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	tenantID := vars["tenant"]
+	agentID := vars["agent"]
+
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse body
+	var rpcReq JSONRPCRequest
+	if err := json.NewDecoder(req.Body).Decode(&rpcReq); err != nil {
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32700, "Parse error"))
+		return
+	}
+
+	// Validate jsonrpc version
+	if rpcReq.JSONRPC != "2.0" {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32600, "Invalid Request: jsonrpc must be \"2.0\""))
+		return
+	}
+
+	// Validate id present
+	if rpcReq.ID == nil {
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32600, "Invalid Request: missing id"))
+		return
+	}
+
+	// Validate method
+	if rpcReq.Method == "" {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32600, "Invalid Request: missing method"))
+		return
+	}
+
+	// Handle GetExtendedAgentCard locally
+	if rpcReq.Method == "GetExtendedAgentCard" {
+		agent := r.GetAgent(tenantID, agentID)
+		if agent == nil {
+			json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "Agent offline"))
+			return
+		}
+		if agent.AgentCard == nil {
+			json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "No agent card"))
+			return
+		}
+		cardJSON, _ := json.Marshal(agent.AgentCard)
+		json.NewEncoder(w).Encode(&JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      rpcReq.ID,
+			Result:  cardJSON,
+		})
+		return
+	}
+
+	// Map method name
+	a2aMethod, ok := jsonrpcMethodMap[rpcReq.Method]
+	if !ok {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32601, "Method not found"))
+		return
+	}
+
+	// Validate client token
+	authHeader := req.Header.Get("Authorization")
+	if authHeader == "" {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "Unauthorized"))
+		return
+	}
+
+	token := authHeader
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		token = authHeader[7:]
+	}
+
+	claims, err := r.ValidateToken(token)
+	if err != nil {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "Invalid token"))
+		return
+	}
+
+	clientTenant, _ := claims["tenant"].(string)
+	if clientTenant != tenantID {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "Tenant mismatch"))
+		return
+	}
+
+	// Find agent
+	agent := r.GetAgent(tenantID, agentID)
+	if agent == nil {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "Agent offline"))
+		return
+	}
+
+	// Forward to agent
+	params := rpcReq.Params
+	if params == nil {
+		params = json.RawMessage(`{}`)
+	}
+
+	resp, err := r.SendRequest(agent, a2aMethod, params, *requestTimeout)
+	if err != nil {
+		log.Printf("[RELAY] JSON-RPC request to agent %s failed: %v", agentID, err)
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, err.Error()))
+		return
+	}
+
+	// Build JSON-RPC response
+	if resp.Error != nil {
+		json.NewEncoder(w).Encode(&JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      rpcReq.ID,
+			Error:   &JSONRPCError{Code: resp.Error.Code, Message: resp.Error.Message},
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(&JSONRPCResponse{
+		JSONRPC: "2.0",
+		ID:      rpcReq.ID,
+		Result:  resp.Result,
+	})
+}
+
 func (r *Relay) handleAgentCard(w http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	tenantID := vars["tenant"]
@@ -449,8 +611,149 @@ func (r *Relay) handleAgentCard(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Enrich agent card with relay-specific fields for TCK compliance
+	card := *agent.AgentCard
+	if card.ID == "" {
+		card.ID = agentID
+	}
+	if card.ProtocolVersion == "" {
+		card.ProtocolVersion = "0.3.0"
+	}
+	if len(card.SupportedProtocolVersions) == 0 {
+		card.SupportedProtocolVersions = []string{"0.3.0"}
+	}
+	// Set URL to the relay's public endpoint for this agent
+	card.URL = fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, tenantID, agentID)
+	// Ensure skills have tags
+	for i := range card.Skills {
+		if len(card.Skills[i].Tags) == 0 {
+			card.Skills[i].Tags = []string{"chat", "general"}
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(agent.AgentCard)
+	json.NewEncoder(w).Encode(card)
+}
+
+// handleRootJSONRPC handles JSON-RPC at the domain root, routing to the first connected agent.
+// This allows TCK to test against just the base URL without knowing tenant/agent.
+func (r *Relay) handleRootJSONRPC(w http.ResponseWriter, req *http.Request) {
+	r.mu.RLock()
+	var firstAgent *ConnectedAgent
+	for _, agent := range r.agents {
+		firstAgent = agent
+		break
+	}
+	r.mu.RUnlock()
+
+	if firstAgent == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32603, "No agents connected"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	var rpcReq JSONRPCRequest
+	if err := json.NewDecoder(req.Body).Decode(&rpcReq); err != nil {
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32700, "Parse error"))
+		return
+	}
+
+	if rpcReq.JSONRPC != "2.0" {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32600, "Invalid Request: jsonrpc must be \"2.0\""))
+		return
+	}
+	if rpcReq.ID == nil {
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32600, "Invalid Request: missing id"))
+		return
+	}
+	if rpcReq.Method == "" {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32600, "Invalid Request: missing method"))
+		return
+	}
+
+	// Handle GetExtendedAgentCard locally
+	if rpcReq.Method == "GetExtendedAgentCard" {
+		if firstAgent.AgentCard == nil {
+			json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "No agent card"))
+			return
+		}
+		cardJSON, _ := json.Marshal(firstAgent.AgentCard)
+		json.NewEncoder(w).Encode(&JSONRPCResponse{JSONRPC: "2.0", ID: rpcReq.ID, Result: cardJSON})
+		return
+	}
+
+	a2aMethod, ok := jsonrpcMethodMap[rpcReq.Method]
+	if !ok {
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32601, "Method not found"))
+		return
+	}
+
+	params := rpcReq.Params
+	if params == nil {
+		params = json.RawMessage(`{}`)
+	}
+
+	resp, err := r.SendRequest(firstAgent, a2aMethod, params, *requestTimeout)
+	if err != nil {
+		log.Printf("[RELAY] Root JSON-RPC request failed: %v", err)
+		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, err.Error()))
+		return
+	}
+
+	if resp.Error != nil {
+		json.NewEncoder(w).Encode(&JSONRPCResponse{
+			JSONRPC: "2.0", ID: rpcReq.ID,
+			Error: &JSONRPCError{Code: resp.Error.Code, Message: resp.Error.Message},
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(&JSONRPCResponse{JSONRPC: "2.0", ID: rpcReq.ID, Result: resp.Result})
+}
+
+// handleRootAgentCard serves the agent card at the domain root for TCK compatibility.
+// The A2A spec says agent cards should be at /.well-known/agent.json (v0.2.5) or
+// /.well-known/agent-card.json (v0.3.0). The TCK strips the SUT URL to domain root.
+func (r *Relay) handleRootAgentCard(w http.ResponseWriter, req *http.Request) {
+	r.mu.RLock()
+	var firstAgent *ConnectedAgent
+	for _, agent := range r.agents {
+		firstAgent = agent
+		break
+	}
+	r.mu.RUnlock()
+
+	if firstAgent == nil {
+		http.Error(w, `{"error":"no agents connected"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	if firstAgent.AgentCard == nil {
+		http.Error(w, `{"error":"no agent card"}`, http.StatusNotFound)
+		return
+	}
+
+	card := *firstAgent.AgentCard
+	if card.ID == "" {
+		card.ID = firstAgent.ID
+	}
+	if card.ProtocolVersion == "" {
+		card.ProtocolVersion = "0.3.0"
+	}
+	if len(card.SupportedProtocolVersions) == 0 {
+		card.SupportedProtocolVersions = []string{"0.3.0"}
+	}
+	card.URL = fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, firstAgent.TenantID, firstAgent.ID)
+	for i := range card.Skills {
+		if len(card.Skills[i].Tags) == 0 {
+			card.Skills[i].Tags = []string{"chat", "general"}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(card)
 }
 
 func (r *Relay) handleListAgents(w http.ResponseWriter, req *http.Request) {
@@ -520,6 +823,7 @@ func (r *Relay) handleRoot(w http.ResponseWriter, req *http.Request) {
 			"health":     "GET /health",
 			"agent_ws":   "WS /agent",
 			"agent_card": "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
+			"jsonrpc":    "POST /t/{tenant}/a2a/{agent}/",
 			"send":       "POST /t/{tenant}/a2a/{agent}/message/send",
 			"stream":     "POST /t/{tenant}/a2a/{agent}/message/stream",
 			"list":       "GET /t/{tenant}/agents",
@@ -549,14 +853,22 @@ func main() {
 	router.HandleFunc("/agent", relay.handleAgentWebSocket)
 
 	// A2A HTTP endpoints (per tenant/agent)
+	router.HandleFunc("/.well-known/agent.json", relay.handleRootAgentCard).Methods("GET")
+	router.HandleFunc("/.well-known/agent-card.json", relay.handleRootAgentCard).Methods("GET")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/.well-known/agent.json", relay.handleAgentCard).Methods("GET")
+	router.HandleFunc("/t/{tenant}/a2a/{agent}/.well-known/agent-card.json", relay.handleAgentCard).Methods("GET")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/message/send", relay.handleA2ARequest).Methods("POST")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/message/stream", relay.handleA2ARequest).Methods("POST")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/tasks/{task}", relay.handleA2ARequest).Methods("GET")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/tasks", relay.handleA2ARequest).Methods("GET")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/tasks/{task}/cancel", relay.handleA2ARequest).Methods("POST")
 
+	// JSON-RPC 2.0 endpoint (A2A protocol binding)
+	router.HandleFunc("/t/{tenant}/a2a/{agent}/", relay.handleJSONRPC).Methods("POST")
+
 	// Agent listing
+	// Root-level JSON-RPC endpoint for TCK — routes to first connected agent
+	router.HandleFunc("/", relay.handleRootJSONRPC).Methods("POST")
 	router.HandleFunc("/t/{tenant}/agents", relay.handleListAgents).Methods("GET")
 
 	srv := &http.Server{
