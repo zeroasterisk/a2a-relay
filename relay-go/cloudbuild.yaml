@@ -5,6 +5,7 @@ substitutions:
   _SERVICE_NAME: a2a-relay
   _REGION: us-central1
   _ENV: dev  # Override with --substitutions _ENV=prod
+  _TAG: latest  # Override with --substitutions _TAG=<commit-sha>
 
 steps:
   # Build the container
@@ -12,17 +13,14 @@ steps:
     args:
       - 'build'
       - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}-${_ENV}:${SHORT_SHA}'
-      - '-t'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}-${_ENV}:latest'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}-${_ENV}:${_TAG}'
       - '.'
 
   # Push to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - '--all-tags'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}-${_ENV}'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}-${_ENV}:${_TAG}'
 
   # Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -32,7 +30,7 @@ steps:
       - 'deploy'
       - '${_SERVICE_NAME}-${_ENV}'
       - '--image'
-      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}-${_ENV}:${SHORT_SHA}'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}-${_ENV}:${_TAG}'
       - '--region'
       - '${_REGION}'
       - '--platform'
