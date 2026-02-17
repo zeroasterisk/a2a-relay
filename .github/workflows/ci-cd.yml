@@ -48,24 +48,16 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Deploy to Cloud Run
+      - name: Build and deploy via Cloud Build
         working-directory: relay-go
         run: |
-          gcloud run deploy $SERVICE_NAME \
-            --source . \
-            --region $REGION \
-            --project $PROJECT_ID \
-            --platform managed \
-            --allow-unauthenticated \
-            --port 8080 \
-            --memory 256Mi \
-            --cpu 1 \
-            --min-instances 0 \
-            --max-instances 10 \
-            --set-env-vars "RELAY_JWT_SECRET=${{ secrets.RELAY_JWT_SECRET }}"
+          gcloud builds submit \
+            --config=cloudbuild.yaml \
+            --project=$PROJECT_ID \
+            --substitutions="_ENV=dev,_JWT_SECRET=${{ secrets.RELAY_JWT_SECRET }}"
 
       - name: Get dev URL
         run: |
-          URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)')
+          URL=$(gcloud run services describe $SERVICE_NAME --region $REGION --project $PROJECT_ID --format 'value(status.url)')
           echo "## Dev Deployment" >> $GITHUB_STEP_SUMMARY
           echo "URL: $URL" >> $GITHUB_STEP_SUMMARY
