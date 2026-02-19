@@ -138,6 +138,14 @@ PORT=8080
 BIND=0.0.0.0
 ```
 
+## Docs
+
+- [**Deployment Guide**](docs/deploy.md) — Cloud Run, Fly.io, Cloudflare Workers, Vercel, self-hosted
+- [**Roadmap**](docs/roadmap.md) — TypeScript relay, message queuing, federation
+- [**Design**](DESIGN.md) — Architecture, auth model, streaming, implementation comparison
+- [**Cloud Run Deployment**](relay-go/DEPLOYMENT.md) — Current Go relay on Cloud Run (secrets, IAM, testing)
+- [**Tech Debt**](BACKLOG.md) — Known issues and improvements
+
 ## Links
 
 - [A2A Protocol](https://a2a-protocol.org)
