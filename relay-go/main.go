@@ -814,20 +814,85 @@ func (r *Relay) handleHealth(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Relay) handleRoot(w http.ResponseWriter, req *http.Request) {
+	// Build public agent index
+	r.mu.RLock()
+	agents := make([]map[string]interface{}, 0)
+	for _, a := range r.agents {
+		entry := map[string]interface{}{
+			"id":       a.ID,
+			"tenant":   a.TenantID,
+			"cardUrl":  fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
+			"url":      fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
+		}
+		if a.AgentCard != nil {
+			entry["name"] = a.AgentCard.Name
+			entry["description"] = a.AgentCard.Description
+			if len(a.AgentCard.Skills) > 0 {
+				skills := make([]map[string]string, 0, len(a.AgentCard.Skills))
+				for _, s := range a.AgentCard.Skills {
+					skills = append(skills, map[string]string{
+						"id":   s.ID,
+						"name": s.Name,
+					})
+				}
+				entry["skills"] = skills
+			}
+		}
+		agents = append(agents, entry)
+	}
+	r.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"name":    "A2A Relay",
 		"version": "0.1.0",
 		"docs":    "https://github.com/zeroasterisk/a2a-relay",
+		"agents":  agents,
 		"endpoints": map[string]string{
-			"health":     "GET /health",
-			"agent_ws":   "WS /agent",
-			"agent_card": "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
-			"jsonrpc":    "POST /t/{tenant}/a2a/{agent}/",
-			"send":       "POST /t/{tenant}/a2a/{agent}/message/send",
-			"stream":     "POST /t/{tenant}/a2a/{agent}/message/stream",
-			"list":       "GET /t/{tenant}/agents",
+			"health":      "GET /health",
+			"agent_ws":    "WS /agent",
+			"agent_index": "GET /.well-known/agents",
+			"agent_card":  "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
+			"jsonrpc":     "POST /t/{tenant}/a2a/{agent}/",
+			"send":        "POST /t/{tenant}/a2a/{agent}/message/send",
+			"stream":      "POST /t/{tenant}/a2a/{agent}/message/stream",
+			"list":        "GET /t/{tenant}/agents (auth required)",
 		},
+	})
+}
+
+// handleAgentIndex serves a public directory of all connected agents.
+// Follows the emerging /.well-known/agents convention from the A2A registry discussion.
+func (r *Relay) handleAgentIndex(w http.ResponseWriter, req *http.Request) {
+	r.mu.RLock()
+	agents := make([]map[string]interface{}, 0)
+	for _, a := range r.agents {
+		entry := map[string]interface{}{
+			"id":       a.ID,
+			"tenant":   a.TenantID,
+			"cardUrl":  fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
+			"url":      fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
+		}
+		if a.AgentCard != nil {
+			entry["name"] = a.AgentCard.Name
+			entry["description"] = a.AgentCard.Description
+			entry["skills"] = a.AgentCard.Skills
+			entry["capabilities"] = a.AgentCard.Capabilities
+			if a.AgentCard.DefaultInputModes != nil {
+				entry["defaultInputModes"] = a.AgentCard.DefaultInputModes
+			}
+			if a.AgentCard.DefaultOutputModes != nil {
+				entry["defaultOutputModes"] = a.AgentCard.DefaultOutputModes
+			}
+		}
+		agents = append(agents, entry)
+	}
+	r.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"agents": agents,
+		"count":  len(agents),
 	})
 }
 
@@ -853,6 +918,7 @@ func main() {
 	router.HandleFunc("/agent", relay.handleAgentWebSocket)
 
 	// A2A HTTP endpoints (per tenant/agent)
+	router.HandleFunc("/.well-known/agents", relay.handleAgentIndex).Methods("GET")
 	router.HandleFunc("/.well-known/agent.json", relay.handleRootAgentCard).Methods("GET")
 	router.HandleFunc("/.well-known/agent-card.json", relay.handleRootAgentCard).Methods("GET")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/.well-known/agent.json", relay.handleAgentCard).Methods("GET")
