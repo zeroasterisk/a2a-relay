@@ -46,8 +46,6 @@ If you use scale-to-zero hosting, the relay process dies when idle. This means:
 
 ## Cloud Run (Current Default)
 
-The Go relay is deployed on Cloud Run today. See [`relay-go/DEPLOYMENT.md`](../relay-go/DEPLOYMENT.md) for full details (secrets, IAM, testing).
-
 ### Scale-to-Zero (Default)
 
 ```bash
@@ -72,9 +70,43 @@ gcloud run services update a2a-relay \
 - **Cost:** ~$5-7/mo (idle billing: ~$0.0064/vCPU-hr + ~$0.0007/GiB-hr)
 - **Trade-off:** Paying for idle, but no cold starts
 
+### IAM (Public Access)
+
+Cloud Run requires an IAM invoker to accept requests. For a public relay:
+
+```bash
+gcloud run services add-iam-policy-binding a2a-relay \
+  --region=us-central1 \
+  --member=allUsers \
+  --role=roles/run.invoker
+```
+
+### Secrets
+
+Use environment variables or Secret Manager:
+
+```bash
+# Direct env var
+gcloud run services update a2a-relay \
+  --region=us-central1 \
+  --set-env-vars="JWT_SECRET=your-secret-here"
+
+# Secret Manager (recommended for production)
+gcloud secrets create a2a-relay-jwt-secret --replication-policy=automatic
+echo -n "your-secret" | gcloud secrets versions add a2a-relay-jwt-secret --data-file=-
+```
+
 ### WebSocket Keepalive
 
 Cloud Run kills idle connections. The relay sends WS-level pings every 30s to keep connections alive. This is handled automatically — no configuration needed.
+
+### Timeouts
+
+| Timeout | Default | Flag |
+|---------|---------|------|
+| Auth timeout | 30s | `-auth-timeout` |
+| Request timeout | 30s | `-request-timeout` |
+| WS keepalive | 30s | (hardcoded) |
 
 ---
 
@@ -282,6 +314,59 @@ cloudflared tunnel --url http://localhost:8080 run a2a-relay
 - **Cost:** $0 (Cloudflare Tunnel is free)
 - **Cold start:** None (always running)
 - **Trade-off:** Depends on your infra reliability; no auto-scaling
+
+---
+
+## JWT Tokens
+
+All platforms use the same JWT auth. Tokens are signed with the relay's `JWT_SECRET`.
+
+### Agent Token
+
+```bash
+# Agent connects via WebSocket
+jwt encode --secret "$JWT_SECRET" '{
+  "tenant": "my-tenant",
+  "agent_id": "my-agent",
+  "role": "agent",
+  "iat": 1739581200,
+  "exp": 1742173200
+}'
+```
+
+### Client Token
+
+```bash
+# Client sends HTTP requests
+jwt encode --secret "$JWT_SECRET" '{
+  "tenant": "my-tenant",
+  "user_id": "my-user",
+  "role": "client",
+  "iat": 1739581200,
+  "exp": 1739667600
+}'
+```
+
+## Testing
+
+```bash
+# Health check
+curl https://your-relay.example.com/health
+
+# Send a test message (requires client JWT)
+curl -X POST https://your-relay.example.com/t/my-tenant/a2a/my-agent/message/send \
+  -H "Authorization: Bearer $CLIENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message": {"role": "user", "parts": [{"text": "Hello!"}]}}'
+```
+
+## Security Best Practices
+
+1. **Rotate secrets regularly** — especially after any exposure
+2. **Use secret management** — Secret Manager (GCP), `fly secrets` (Fly), Wrangler secrets (CF)
+3. **Set minimum secret length** — 32+ characters
+4. **Monitor access logs** — all platforms provide request logging
+5. **Consider rate limiting** — not built into the relay yet (see [roadmap](roadmap.md))
 
 ---
 
