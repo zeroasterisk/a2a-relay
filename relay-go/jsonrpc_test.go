@@ -409,6 +409,235 @@ func TestJSONRPC_SendMessage_Integration(t *testing.T) {
 	}
 }
 
+// connectMockAgent dials WS, authenticates, returns the connection
+func connectMockAgent(t *testing.T, srvURL string, token, agentID string) *websocket.Conn {
+	t.Helper()
+	wsURL := "ws" + srvURL[4:] + "/agent"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("WebSocket dial failed: %v", err)
+	}
+	ws.WriteJSON(map[string]interface{}{
+		"type":     "auth",
+		"token":    token,
+		"agent_id": agentID,
+		"agent_card": map[string]interface{}{
+			"name":    agentID,
+			"url":     "http://localhost",
+			"version": "1.0",
+			"capabilities": map[string]bool{},
+		},
+	})
+	var authResp map[string]interface{}
+	ws.ReadJSON(&authResp)
+	if authResp["type"] != "auth_ok" {
+		t.Fatalf("Expected auth_ok, got %v", authResp)
+	}
+	return ws
+}
+
+// runMockAgentHandler reads WS messages and echoes a2a.request back with success
+func runMockAgentHandler(ws *websocket.Conn, done chan struct{}) {
+	defer close(done)
+	for {
+		var msg map[string]json.RawMessage
+		if err := ws.ReadJSON(&msg); err != nil {
+			return
+		}
+		msgType := ""
+		json.Unmarshal(msg["type"], &msgType)
+		if msgType == "a2a.request" {
+			var req A2ARequest
+			json.Unmarshal(msg["payload"], &req)
+			ws.WriteJSON(map[string]interface{}{
+				"type": "a2a.response",
+				"payload": map[string]interface{}{
+					"id":     req.ID,
+					"result": map[string]string{"status": "completed"},
+				},
+			})
+		}
+	}
+}
+
+func TestReconnectDelivery(t *testing.T) {
+	relay := newTestRelay()
+	router := mux.NewRouter()
+	router.HandleFunc("/t/{tenant}/a2a/{agent}/", relay.handleJSONRPC).Methods("POST")
+	router.HandleFunc("/t/{tenant}/tasks/{taskId}", relay.handleTaskPoll).Methods("GET")
+	router.HandleFunc("/agent", relay.handleAgentWebSocket)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	token := generateTestJWT(t, relay, "demo", "bot1")
+
+	// Step 1: Connect agent, then disconnect
+	ws1 := connectMockAgent(t, srv.URL, token, "bot1")
+	time.Sleep(50 * time.Millisecond) // let registration complete
+	ws1.Close()
+	time.Sleep(100 * time.Millisecond) // let unregister propagate
+
+	// Verify agent is offline
+	agent := relay.GetAgent("demo", "bot1")
+	if agent != nil {
+		t.Fatal("Agent should be offline after disconnect")
+	}
+
+	// Step 2: Send a message while agent is offline (expect 202)
+	rpcBody, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "SendMessage",
+		"params":  map[string]interface{}{"message": map[string]string{"text": "hello-offline"}},
+		"id":      1,
+	})
+
+	// Use a short timeout client so we don't wait 30s
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest("POST", srv.URL+"/t/demo/a2a/bot1/", bytes.NewReader(rpcBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	// Send in background (will block up to mailboxSyncWait)
+	type httpResult struct {
+		resp *http.Response
+		err  error
+	}
+	resultCh := make(chan httpResult, 1)
+	go func() {
+		resp, err := client.Do(req)
+		resultCh <- httpResult{resp, err}
+	}()
+
+	// Step 3: While request is waiting, reconnect the agent
+	time.Sleep(500 * time.Millisecond)
+	ws2 := connectMockAgent(t, srv.URL, token, "bot1")
+	defer ws2.Close()
+
+	// Start handler on reconnected agent
+	done := make(chan struct{})
+	go runMockAgentHandler(ws2, done)
+
+	// Step 4: Wait for the HTTP response — should get 200 with the flushed result
+	select {
+	case hr := <-resultCh:
+		if hr.err != nil {
+			t.Fatalf("Request failed: %v", hr.err)
+		}
+		defer hr.resp.Body.Close()
+
+		var rpcResp JSONRPCResponse
+		json.NewDecoder(hr.resp.Body).Decode(&rpcResp)
+
+		if rpcResp.Error != nil {
+			t.Fatalf("Expected success, got error: %+v", rpcResp.Error)
+		}
+		if rpcResp.Result == nil {
+			t.Fatal("Expected result, got nil")
+		}
+		var result map[string]string
+		json.Unmarshal(rpcResp.Result, &result)
+		if result["status"] != "completed" {
+			t.Errorf("Expected completed, got %s", result["status"])
+		}
+		t.Logf("✅ Reconnect delivery succeeded: %v", result)
+
+	case <-time.After(35 * time.Second):
+		t.Fatal("Timed out waiting for response")
+	}
+}
+
+func TestReconnectDelivery_TaskPolling(t *testing.T) {
+	// Tests the 202 → poll path: message queued, client gets 202, then polls for result
+	relay := newTestRelay()
+	router := mux.NewRouter()
+	router.HandleFunc("/t/{tenant}/a2a/{agent}/", relay.handleJSONRPC).Methods("POST")
+	router.HandleFunc("/t/{tenant}/tasks/{taskId}", relay.handleTaskPoll).Methods("GET")
+	router.HandleFunc("/agent", relay.handleAgentWebSocket)
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	token := generateTestJWT(t, relay, "demo", "bot1")
+
+	// Agent is offline — message will be queued
+	rpcBody, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "SendMessage",
+		"params":  map[string]interface{}{"message": map[string]string{"text": "poll-test"}},
+		"id":      1,
+	})
+
+	// Send with very short timeout so we get 202 instead of waiting
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest("POST", srv.URL+"/t/demo/a2a/bot1/", bytes.NewReader(rpcBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	type httpResult struct {
+		resp *http.Response
+		err  error
+	}
+	resultCh := make(chan httpResult, 1)
+	go func() {
+		resp, err := client.Do(req)
+		resultCh <- httpResult{resp, err}
+	}()
+
+	// Wait a moment then check health for queued message
+	time.Sleep(200 * time.Millisecond)
+
+	// Connect agent — it should get the flushed message
+	ws := connectMockAgent(t, srv.URL, token, "bot1")
+	defer ws.Close()
+	done := make(chan struct{})
+	go runMockAgentHandler(ws, done)
+
+	// The original request should resolve now (agent reconnected within sync wait)
+	hr := <-resultCh
+	if hr.err != nil {
+		t.Fatalf("Request failed: %v", hr.err)
+	}
+	defer hr.resp.Body.Close()
+
+	// If we got 200, the sync wait caught the flush. If 202, we poll.
+	if hr.resp.StatusCode == http.StatusAccepted {
+		var acceptedResp map[string]interface{}
+		json.NewDecoder(hr.resp.Body).Decode(&acceptedResp)
+		taskID, ok := acceptedResp["task_id"].(string)
+		if !ok || taskID == "" {
+			t.Fatal("Expected task_id in 202 response")
+		}
+
+		// Give flush time to complete
+		time.Sleep(500 * time.Millisecond)
+
+		// Poll for result
+		pollReq, _ := http.NewRequest("GET", srv.URL+"/t/demo/tasks/"+taskID, nil)
+		pollReq.Header.Set("Authorization", "Bearer "+token)
+		pollResp, err := http.DefaultClient.Do(pollReq)
+		if err != nil {
+			t.Fatalf("Poll failed: %v", err)
+		}
+		defer pollResp.Body.Close()
+
+		var pollResult map[string]interface{}
+		json.NewDecoder(pollResp.Body).Decode(&pollResult)
+		if pollResult["status"] != "completed" {
+			t.Errorf("Expected completed, got %v", pollResult["status"])
+		}
+		t.Logf("✅ Task polling after reconnect succeeded: %v", pollResult)
+	} else {
+		// Got 200 directly — flush happened within sync wait
+		var rpcResp JSONRPCResponse
+		json.NewDecoder(hr.resp.Body).Decode(&rpcResp)
+		if rpcResp.Error != nil {
+			t.Fatalf("Expected success: %+v", rpcResp.Error)
+		}
+		t.Log("✅ Got 200 directly (flush within sync wait)")
+	}
+}
+
 // generateTestJWT creates a valid JWT for testing
 func generateTestJWT(t *testing.T, relay *Relay, tenant, agentID string) string {
 	t.Helper()
