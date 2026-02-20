@@ -114,23 +114,205 @@ type A2AError struct {
 	Message string `json:"message"`
 }
 
+// QueuedMessage is a message buffered for an offline agent
+type QueuedMessage struct {
+	ID         string
+	Method     string
+	Params     json.RawMessage
+	QueuedAt   time.Time
+	ResponseCh chan *A2AResponse // for clients waiting synchronously
+	TenantID   string
+	AgentID    string
+}
+
+// Mailbox holds queued messages for an agent
+type Mailbox struct {
+	mu       sync.Mutex
+	messages []*QueuedMessage
+}
+
+// TaskResult stores the result of a completed queued task
+type TaskResult struct {
+	ID        string
+	Response  *A2AResponse
+	CreatedAt time.Time
+}
+
 // Relay manages agents and requests
 type Relay struct {
 	agents          map[string]*ConnectedAgent // key: tenantID:agentID
 	pendingRequests map[string]*PendingRequest
+	mailboxes       map[string]*Mailbox    // key: tenantID:agentID
+	taskResults     map[string]*TaskResult // key: taskID
 	jwtSecret       []byte
 	mu              sync.RWMutex
 	upgrader        websocket.Upgrader
 }
 
+const (
+	maxMailboxMessages = 999
+	messageTTL         = 9 * 24 * time.Hour
+	mailboxSyncWait    = 30 * time.Second
+	cleanupInterval    = 1 * time.Hour
+)
+
 func NewRelay(jwtSecret string) *Relay {
-	return &Relay{
+	r := &Relay{
 		agents:          make(map[string]*ConnectedAgent),
 		pendingRequests: make(map[string]*PendingRequest),
+		mailboxes:       make(map[string]*Mailbox),
+		taskResults:     make(map[string]*TaskResult),
 		jwtSecret:       []byte(jwtSecret),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
+	}
+	go r.cleanupLoop()
+	return r
+}
+
+// cleanupLoop periodically purges expired messages and task results
+func (r *Relay) cleanupLoop() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		r.mu.Lock()
+		// Clean task results
+		for id, tr := range r.taskResults {
+			if now.Sub(tr.CreatedAt) > messageTTL {
+				delete(r.taskResults, id)
+			}
+		}
+		// Clean mailboxes
+		for key, mb := range r.mailboxes {
+			mb.mu.Lock()
+			filtered := mb.messages[:0]
+			for _, msg := range mb.messages {
+				if now.Sub(msg.QueuedAt) <= messageTTL {
+					filtered = append(filtered, msg)
+				} else {
+					// Close waiting clients
+					close(msg.ResponseCh)
+				}
+			}
+			// Enforce max limit (keep newest)
+			if len(filtered) > maxMailboxMessages {
+				for _, msg := range filtered[:len(filtered)-maxMailboxMessages] {
+					close(msg.ResponseCh)
+				}
+				filtered = filtered[len(filtered)-maxMailboxMessages:]
+			}
+			mb.messages = filtered
+			if len(mb.messages) == 0 {
+				delete(r.mailboxes, key)
+			}
+			mb.mu.Unlock()
+		}
+		r.mu.Unlock()
+		log.Printf("[RELAY] Cleanup complete")
+	}
+}
+
+// QueueMessage adds a message to an agent's mailbox, returns the queued message
+func (r *Relay) QueueMessage(tenantID, agentID, method string, params json.RawMessage) *QueuedMessage {
+	key := agentKey(tenantID, agentID)
+
+	r.mu.Lock()
+	mb, ok := r.mailboxes[key]
+	if !ok {
+		mb = &Mailbox{}
+		r.mailboxes[key] = mb
+	}
+	r.mu.Unlock()
+
+	msg := &QueuedMessage{
+		ID:         uuid.NewString(),
+		Method:     method,
+		Params:     params,
+		QueuedAt:   time.Now(),
+		ResponseCh: make(chan *A2AResponse, 1),
+		TenantID:   tenantID,
+		AgentID:    agentID,
+	}
+
+	mb.mu.Lock()
+	// Enforce limit
+	if len(mb.messages) >= maxMailboxMessages {
+		// Drop oldest
+		old := mb.messages[0]
+		close(old.ResponseCh)
+		mb.messages = mb.messages[1:]
+	}
+	mb.messages = append(mb.messages, msg)
+	mb.mu.Unlock()
+
+	log.Printf("[RELAY] Queued message %s for %s:%s (method: %s)", msg.ID, tenantID, agentID, method)
+	return msg
+}
+
+// FlushMailbox delivers all queued messages to a newly connected agent
+func (r *Relay) FlushMailbox(tenantID, agentID string, agent *ConnectedAgent) {
+	key := agentKey(tenantID, agentID)
+
+	r.mu.RLock()
+	mb, ok := r.mailboxes[key]
+	r.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	mb.mu.Lock()
+	messages := mb.messages
+	mb.messages = nil
+	mb.mu.Unlock()
+
+	if len(messages) == 0 {
+		return
+	}
+
+	log.Printf("[RELAY] Flushing %d queued messages to %s:%s", len(messages), tenantID, agentID)
+
+	for _, msg := range messages {
+		go func(msg *QueuedMessage) {
+			resp, err := r.SendRequest(agent, msg.Method, msg.Params, *requestTimeout)
+			if err != nil {
+				log.Printf("[RELAY] Failed to deliver queued message %s: %v", msg.ID, err)
+				resp = &A2AResponse{
+					ID:    msg.ID,
+					Error: &A2AError{Code: -32603, Message: err.Error()},
+				}
+			}
+
+			// Store result for polling
+			r.mu.Lock()
+			r.taskResults[msg.ID] = &TaskResult{
+				ID:        msg.ID,
+				Response:  resp,
+				CreatedAt: time.Now(),
+			}
+			r.mu.Unlock()
+
+			// Notify waiting client
+			select {
+			case msg.ResponseCh <- resp:
+			default:
+			}
+		}(msg)
+	}
+}
+
+// waitForQueuedResponse waits for a queued message response with sync timeout,
+// returns the response or nil (caller should return 202)
+func (r *Relay) waitForQueuedResponse(msg *QueuedMessage) *A2AResponse {
+	select {
+	case resp, ok := <-msg.ResponseCh:
+		if ok && resp != nil {
+			return resp
+		}
+		return nil
+	case <-time.After(mailboxSyncWait):
+		return nil
 	}
 }
 
@@ -153,6 +335,9 @@ func (r *Relay) RegisterAgent(tenantID, agentID string, conn *websocket.Conn, ca
 		ConnectedAt: time.Now(),
 	}
 	log.Printf("[RELAY] Agent registered: %s (tenant: %s)", agentID, tenantID)
+
+	// Flush any queued messages (must be called after unlock)
+	go r.FlushMailbox(tenantID, agentID, r.agents[key])
 }
 
 // UnregisterAgent removes an agent
@@ -423,13 +608,6 @@ func (r *Relay) handleA2ARequest(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Find agent
-	agent := r.GetAgent(tenantID, agentID)
-	if agent == nil {
-		http.Error(w, `{"error":"agent_offline"}`, http.StatusServiceUnavailable)
-		return
-	}
-
 	// Parse A2A request body
 	var body json.RawMessage
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
@@ -441,6 +619,30 @@ func (r *Relay) handleA2ARequest(w http.ResponseWriter, req *http.Request) {
 	method := "message/send"
 	if vars["method"] != "" {
 		method = vars["method"]
+	}
+
+	// Find agent
+	agent := r.GetAgent(tenantID, agentID)
+	if agent == nil {
+		// Agent offline — queue message and wait
+		msg := r.QueueMessage(tenantID, agentID, method, body)
+		resp := r.waitForQueuedResponse(msg)
+		w.Header().Set("Content-Type", "application/json")
+		if resp != nil {
+			if resp.Error != nil {
+				w.WriteHeader(http.StatusBadRequest)
+			}
+			json.NewEncoder(w).Encode(resp.Result)
+			return
+		}
+		// No response within sync wait — return 202 with task_id
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "queued",
+			"task_id": msg.ID,
+			"message": "Agent is offline. Message queued for delivery.",
+		})
+		return
 	}
 
 	// Forward to agent (use configured default timeout)
@@ -558,17 +760,37 @@ func (r *Relay) handleJSONRPC(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Find agent
-	agent := r.GetAgent(tenantID, agentID)
-	if agent == nil {
-		json.NewEncoder(w).Encode(jsonrpcError(rpcReq.ID, -32603, "Agent offline"))
-		return
-	}
-
 	// Forward to agent
 	params := rpcReq.Params
 	if params == nil {
 		params = json.RawMessage(`{}`)
+	}
+
+	// Find agent
+	agent := r.GetAgent(tenantID, agentID)
+	if agent == nil {
+		// Agent offline — queue and wait
+		msg := r.QueueMessage(tenantID, agentID, a2aMethod, params)
+		resp := r.waitForQueuedResponse(msg)
+		if resp != nil {
+			if resp.Error != nil {
+				json.NewEncoder(w).Encode(&JSONRPCResponse{
+					JSONRPC: "2.0", ID: rpcReq.ID,
+					Error: &JSONRPCError{Code: resp.Error.Code, Message: resp.Error.Message},
+				})
+				return
+			}
+			json.NewEncoder(w).Encode(&JSONRPCResponse{JSONRPC: "2.0", ID: rpcReq.ID, Result: resp.Result})
+			return
+		}
+		// No response — return queued status
+		w.WriteHeader(http.StatusAccepted)
+		resultJSON, _ := json.Marshal(map[string]interface{}{
+			"status": "queued", "task_id": msg.ID,
+			"message": "Agent is offline. Message queued for delivery.",
+		})
+		json.NewEncoder(w).Encode(&JSONRPCResponse{JSONRPC: "2.0", ID: rpcReq.ID, Result: resultJSON})
+		return
 	}
 
 	resp, err := r.SendRequest(agent, a2aMethod, params, *requestTimeout)
@@ -798,18 +1020,90 @@ func (r *Relay) handleListAgents(w http.ResponseWriter, req *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
+func (r *Relay) handleTaskPoll(w http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	tenantID := vars["tenant"]
+	taskID := vars["taskId"]
+
+	// Validate client token
+	authHeader := req.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	token := authHeader
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		token = authHeader[7:]
+	}
+	claims, err := r.ValidateToken(token)
+	if err != nil {
+		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+		return
+	}
+	clientTenant, _ := claims["tenant"].(string)
+	if clientTenant != tenantID {
+		http.Error(w, `{"error":"tenant mismatch"}`, http.StatusForbidden)
+		return
+	}
+
+	// Check for completed result
+	r.mu.RLock()
+	tr, ok := r.taskResults[taskID]
+	r.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	if ok {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "completed",
+			"task_id":  tr.ID,
+			"response": tr.Response,
+		})
+		return
+	}
+
+	// Check if still queued
+	r.mu.RLock()
+	for _, mb := range r.mailboxes {
+		mb.mu.Lock()
+		for _, msg := range mb.messages {
+			if msg.ID == taskID {
+				mb.mu.Unlock()
+				r.mu.RUnlock()
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"status":  "queued",
+					"task_id": taskID,
+				})
+				return
+			}
+		}
+		mb.mu.Unlock()
+	}
+	r.mu.RUnlock()
+
+	http.Error(w, `{"error":"task not found"}`, http.StatusNotFound)
+}
+
 func (r *Relay) handleHealth(w http.ResponseWriter, req *http.Request) {
 	r.mu.RLock()
 	agentCount := len(r.agents)
 	pendingCount := len(r.pendingRequests)
+	queuedCount := 0
+	for _, mb := range r.mailboxes {
+		mb.mu.Lock()
+		queuedCount += len(mb.messages)
+		mb.mu.Unlock()
+	}
+	taskCount := len(r.taskResults)
 	r.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":           "ok",
-		"version":          "0.1.0",
-		"agents_connected": agentCount,
-		"pending_requests": pendingCount,
+		"status":            "ok",
+		"version":           "0.2.0",
+		"agents_connected":  agentCount,
+		"pending_requests":  pendingCount,
+		"queued_messages":   queuedCount,
+		"completed_tasks":   taskCount,
 	})
 }
 
@@ -928,6 +1222,9 @@ func main() {
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/tasks/{task}", relay.handleA2ARequest).Methods("GET")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/tasks", relay.handleA2ARequest).Methods("GET")
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/tasks/{task}/cancel", relay.handleA2ARequest).Methods("POST")
+
+	// Task polling endpoint
+	router.HandleFunc("/t/{tenant}/tasks/{taskId}", relay.handleTaskPoll).Methods("GET")
 
 	// JSON-RPC 2.0 endpoint (A2A protocol binding)
 	router.HandleFunc("/t/{tenant}/a2a/{agent}/", relay.handleJSONRPC).Methods("POST")
