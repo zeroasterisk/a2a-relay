@@ -88,6 +88,49 @@ RELAY_URL=http://localhost:8080 pytest tests/
 
 ---
 
+## Near Term: Per-Agent Auth & Sender Identity
+
+**Priority: High** — Current shared-secret model doesn't scale to multiple senders.
+
+### Problem
+
+Today: one JWT secret per tenant. Anyone with it can impersonate any agent or send as any sender. Fine for single-user dev, breaks for multi-agent production.
+
+### Requirements
+
+1. **Many senders** — multiple clients (proxies, UIs, other agents) can send messages
+2. **No impersonation** — sender A can't pretend to be sender B, and no one can pretend to be the receiving agent
+3. **Easy onboarding** — adding a new sender shouldn't require touching every config
+
+### Proposed Design: API Keys + Agent Binding
+
+```
+Tenant: tck
+├── Agent "zaf" ← bound to agent key (only this key can connect as zaf)
+├── Sender key "proxy-1" ← can send TO any agent, identity stamped as "proxy-1"
+├── Sender key "web-ui" ← can send TO any agent, identity stamped as "web-ui"
+└── Sender key "other-agent" ← can send TO any agent, identity stamped as "other-agent"
+```
+
+**Key types:**
+- **Agent key** — can connect via WebSocket as a specific agent ID. One key per agent. Used by OpenClaw gateways.
+- **Sender key** — can send messages via HTTP to any agent. Cannot connect as an agent. Identity is stamped by the relay (not self-reported). Used by proxies, UIs, external clients.
+
+**Onboarding flow:**
+1. Relay admin creates tenant + first agent key (CLI or API)
+2. Admin generates sender keys as needed (`relay keys create --tenant tck --name "proxy-1" --role sender`)
+3. Sender uses key as Bearer token — relay stamps sender identity automatically
+
+**What changes:**
+- JWT claims include `role: "agent" | "sender"` and `identity: "<name>"`
+- Relay enforces: only `role: agent` can open WebSocket connections
+- Relay stamps `sender` identity on messages (clients can't forge it)
+- Agent keys are bound to a specific agent ID (can't connect as someone else)
+
+**Migration:** Existing shared-secret JWTs continue to work as "admin" role (backward compatible). New key types are opt-in.
+
+---
+
 ## Medium Term: Reliability
 
 ### Message Queuing
