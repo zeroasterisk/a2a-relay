@@ -327,6 +327,11 @@ func (r *Relay) RegisterAgent(tenantID, agentID string, conn *websocket.Conn, ca
 	defer r.mu.Unlock()
 
 	key := agentKey(tenantID, agentID)
+	// V12: Detect agent conflict — close old connection
+	if existing, ok := r.agents[key]; ok {
+		log.Printf("[RELAY] WARNING: Agent %s (tenant: %s) re-registering — closing old connection", agentID, tenantID)
+		existing.Conn.Close()
+	}
 	r.agents[key] = &ConnectedAgent{
 		ID:          agentID,
 		TenantID:    tenantID,
@@ -431,7 +436,8 @@ func (r *Relay) HandleAgentResponse(resp *A2AResponse) {
 	}
 }
 
-// ValidateToken validates a JWT and returns claims
+// ValidateToken validates a JWT and returns claims.
+// Requires the token to have an exp claim (V5).
 func (r *Relay) ValidateToken(tokenString string) (jwt.MapClaims, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -445,6 +451,18 @@ func (r *Relay) ValidateToken(tokenString string) (jwt.MapClaims, error) {
 	}
 
 	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		// V5: Require exp claim
+		exp, hasExp := claims["exp"]
+		if !hasExp || exp == nil {
+			return nil, fmt.Errorf("token missing required exp claim")
+		}
+		// Enforce max expiry window of 24 hours from now
+		if expFloat, ok := exp.(float64); ok {
+			maxExp := float64(time.Now().Add(24*time.Hour).Unix()) + 60 // 1 min grace
+			if expFloat > maxExp {
+				return nil, fmt.Errorf("token exp too far in the future (max 24h)")
+			}
+		}
 		return claims, nil
 	}
 
@@ -491,13 +509,16 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 	}
 
 	tenantID, _ := claims["tenant"].(string)
-	agentID := authMsg.AgentID
+	// V4: Enforce agent_id from token claims, not from WS message
+	agentID, _ := claims["agent_id"].(string)
 	if agentID == "" {
-		agentID, _ = claims["agent_id"].(string)
+		log.Printf("[RELAY] Auth rejected: token missing agent_id claim")
+		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "token missing required agent_id claim"})
+		return
 	}
 
-	if tenantID == "" || agentID == "" {
-		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "missing tenant or agent_id"})
+	if tenantID == "" {
+		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "missing tenant in token"})
 		return
 	}
 
@@ -667,6 +688,26 @@ var jsonrpcMethodMap = map[string]string{
 	"GetTask":     "tasks/get",
 	"ListTasks":   "tasks/list",
 	"CancelTask":  "tasks/cancel",
+}
+
+// isRawToken checks if the auth header looks like a raw JWT (not prefixed with "Bearer ")
+func isRawToken(s string) bool {
+	return len(s) > 20 // JWTs are much longer than 20 chars
+}
+
+// extractBearerToken extracts the token from an Authorization header, handling both
+// "Bearer <token>" and raw token formats. Returns ("", false) if header is empty.
+func extractBearerToken(authHeader string) (string, bool) {
+	if authHeader == "" {
+		return "", false
+	}
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		return authHeader[7:], true
+	}
+	if isRawToken(authHeader) {
+		return authHeader, true
+	}
+	return "", false
 }
 
 func jsonrpcError(id interface{}, code int, message string) *JSONRPCResponse {
@@ -860,21 +901,44 @@ func (r *Relay) handleAgentCard(w http.ResponseWriter, req *http.Request) {
 // handleRootJSONRPC handles JSON-RPC at the domain root, routing to the first connected agent.
 // This allows TCK to test against just the base URL without knowing tenant/agent.
 func (r *Relay) handleRootJSONRPC(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// V1: Require Bearer token auth
+	authHeader := req.Header.Get("Authorization")
+	if authHeader == "" || (len(authHeader) < 8 && !isRawToken(authHeader)) {
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32603, "Unauthorized"))
+		return
+	}
+	token := authHeader
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		token = authHeader[7:]
+	}
+	claims, err := r.ValidateToken(token)
+	if err != nil {
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32603, "Invalid token"))
+		return
+	}
+	callerTenant, _ := claims["tenant"].(string)
+	if callerTenant == "" {
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32603, "Token missing tenant claim"))
+		return
+	}
+
+	// Find first agent matching caller's tenant
 	r.mu.RLock()
 	var firstAgent *ConnectedAgent
 	for _, agent := range r.agents {
-		firstAgent = agent
-		break
+		if agent.TenantID == callerTenant {
+			firstAgent = agent
+			break
+		}
 	}
 	r.mu.RUnlock()
 
 	if firstAgent == nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(jsonrpcError(nil, -32603, "No agents connected"))
+		json.NewEncoder(w).Encode(jsonrpcError(nil, -32603, "No agents connected for tenant"))
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
 
 	var rpcReq JSONRPCRequest
 	if err := json.NewDecoder(req.Body).Decode(&rpcReq); err != nil {
@@ -939,11 +1003,21 @@ func (r *Relay) handleRootJSONRPC(w http.ResponseWriter, req *http.Request) {
 // The A2A spec says agent cards should be at /.well-known/agent.json (v0.2.5) or
 // /.well-known/agent-card.json (v0.3.0). The TCK strips the SUT URL to domain root.
 func (r *Relay) handleRootAgentCard(w http.ResponseWriter, req *http.Request) {
+	// V2: Scope to caller's tenant if auth provided, otherwise pick first (for TCK compat)
+	var callerTenant string
+	if token, ok := extractBearerToken(req.Header.Get("Authorization")); ok {
+		if claims, err := r.ValidateToken(token); err == nil {
+			callerTenant, _ = claims["tenant"].(string)
+		}
+	}
+
 	r.mu.RLock()
 	var firstAgent *ConnectedAgent
 	for _, agent := range r.agents {
-		firstAgent = agent
-		break
+		if callerTenant == "" || agent.TenantID == callerTenant {
+			firstAgent = agent
+			break
+		}
 	}
 	r.mu.RUnlock()
 
@@ -984,12 +1058,12 @@ func (r *Relay) handleListAgents(w http.ResponseWriter, req *http.Request) {
 
 	// Validate client token
 	authHeader := req.Header.Get("Authorization")
-	if authHeader == "" {
+	// V10: Fix panic on short auth header
+	token, ok := extractBearerToken(authHeader)
+	if !ok {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
-
-	token := authHeader[7:] // Strip "Bearer "
 	claims, err := r.ValidateToken(token)
 	if err != nil {
 		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
@@ -1108,15 +1182,47 @@ func (r *Relay) handleHealth(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *Relay) handleRoot(w http.ResponseWriter, req *http.Request) {
-	// Build public agent index
+	w.Header().Set("Content-Type", "application/json")
+
+	// V2: Require auth, scope agent list to caller's tenant
+	token, ok := extractBearerToken(req.Header.Get("Authorization"))
+	if !ok {
+		// Return basic info without agent list for unauthenticated requests
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"name":    "A2A Relay",
+			"version": "0.2.0",
+			"docs":    "https://github.com/zeroasterisk/a2a-relay",
+			"message": "Authenticate with Bearer token to see agents",
+			"endpoints": map[string]string{
+				"health":     "GET /health",
+				"agent_ws":   "WS /agent",
+				"agent_card": "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
+				"jsonrpc":    "POST /t/{tenant}/a2a/{agent}/",
+				"send":       "POST /t/{tenant}/a2a/{agent}/message/send",
+				"list":       "GET /t/{tenant}/agents (auth required)",
+			},
+		})
+		return
+	}
+
+	claims, err := r.ValidateToken(token)
+	if err != nil {
+		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+		return
+	}
+	callerTenant, _ := claims["tenant"].(string)
+
+	// Only show agents for the caller's tenant
 	r.mu.RLock()
 	agents := make([]map[string]interface{}, 0)
 	for _, a := range r.agents {
+		if a.TenantID != callerTenant {
+			continue
+		}
 		entry := map[string]interface{}{
-			"id":       a.ID,
-			"tenant":   a.TenantID,
-			"cardUrl":  fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
-			"url":      fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
+			"id":      a.ID,
+			"cardUrl": fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
+			"url":     fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
 		}
 		if a.AgentCard != nil {
 			entry["name"] = a.AgentCard.Name
@@ -1136,21 +1242,19 @@ func (r *Relay) handleRoot(w http.ResponseWriter, req *http.Request) {
 	}
 	r.mu.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"name":    "A2A Relay",
-		"version": "0.1.0",
+		"version": "0.2.0",
 		"docs":    "https://github.com/zeroasterisk/a2a-relay",
+		"tenant":  callerTenant,
 		"agents":  agents,
 		"endpoints": map[string]string{
-			"health":      "GET /health",
-			"agent_ws":    "WS /agent",
-			"agent_index": "GET /.well-known/agents",
-			"agent_card":  "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
-			"jsonrpc":     "POST /t/{tenant}/a2a/{agent}/",
-			"send":        "POST /t/{tenant}/a2a/{agent}/message/send",
-			"stream":      "POST /t/{tenant}/a2a/{agent}/message/stream",
-			"list":        "GET /t/{tenant}/agents (auth required)",
+			"health":     "GET /health",
+			"agent_ws":   "WS /agent",
+			"agent_card": "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
+			"jsonrpc":    "POST /t/{tenant}/a2a/{agent}/",
+			"send":       "POST /t/{tenant}/a2a/{agent}/message/send",
+			"list":       "GET /t/{tenant}/agents (auth required)",
 		},
 	})
 }
@@ -1158,32 +1262,42 @@ func (r *Relay) handleRoot(w http.ResponseWriter, req *http.Request) {
 // handleAgentIndex serves a public directory of all connected agents.
 // Follows the emerging /.well-known/agents convention from the A2A registry discussion.
 func (r *Relay) handleAgentIndex(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// V2: Require auth, scope to caller's tenant
+	token, ok := extractBearerToken(req.Header.Get("Authorization"))
+	if !ok {
+		http.Error(w, `{"error":"unauthorized — Bearer token required"}`, http.StatusUnauthorized)
+		return
+	}
+	claims, err := r.ValidateToken(token)
+	if err != nil {
+		http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+		return
+	}
+	callerTenant, _ := claims["tenant"].(string)
+
 	r.mu.RLock()
 	agents := make([]map[string]interface{}, 0)
 	for _, a := range r.agents {
+		if a.TenantID != callerTenant {
+			continue
+		}
 		entry := map[string]interface{}{
-			"id":       a.ID,
-			"tenant":   a.TenantID,
-			"cardUrl":  fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
-			"url":      fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
+			"id":      a.ID,
+			"cardUrl": fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
+			"url":     fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
 		}
 		if a.AgentCard != nil {
 			entry["name"] = a.AgentCard.Name
 			entry["description"] = a.AgentCard.Description
 			entry["skills"] = a.AgentCard.Skills
 			entry["capabilities"] = a.AgentCard.Capabilities
-			if a.AgentCard.DefaultInputModes != nil {
-				entry["defaultInputModes"] = a.AgentCard.DefaultInputModes
-			}
-			if a.AgentCard.DefaultOutputModes != nil {
-				entry["defaultOutputModes"] = a.AgentCard.DefaultOutputModes
-			}
 		}
 		agents = append(agents, entry)
 	}
 	r.mu.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"agents": agents,
 		"count":  len(agents),
