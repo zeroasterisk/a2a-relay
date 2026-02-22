@@ -251,9 +251,11 @@ func TestRootJSONRPC_ParseError(t *testing.T) {
 	relay.RegisterAgent("t", "a", nil, nil)
 	defer relay.UnregisterAgent("t", "a")
 
+	token := generateTestJWT(t, relay, "t", "a")
 	router := newTestRouter(relay)
 	r := httptest.NewRequest("POST", "/", bytes.NewReader([]byte("bad")))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, r)
 
@@ -268,8 +270,9 @@ func TestRootJSONRPC_MethodNotFound(t *testing.T) {
 	relay.RegisterAgent("t", "a", nil, nil)
 	defer relay.UnregisterAgent("t", "a")
 
+	token := generateTestJWT(t, relay, "t", "a")
 	router := newTestRouter(relay)
-	w := postJSONRPC(router, "/", map[string]interface{}{
+	w := postJSONRPCWithAuth(router, "/", token, map[string]interface{}{
 		"jsonrpc": "2.0",
 		"method":  "Nope",
 		"id":      1,
@@ -652,4 +655,26 @@ func generateTestJWT(t *testing.T, relay *Relay, tenant, agentID string) string 
 		t.Fatalf("Failed to sign JWT: %v", err)
 	}
 	return signed
+}
+
+func TestRootJSONRPC_Unauthorized(t *testing.T) {
+	relay := newTestRelay()
+	relay.RegisterAgent("t", "a", nil, nil)
+	defer relay.UnregisterAgent("t", "a")
+
+	router := newTestRouter(relay)
+	// No auth header
+	w := postJSONRPC(router, "/", map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "message/send",
+		"id":      1,
+	})
+
+	resp := decodeResponse(t, w)
+	if resp.Error == nil || resp.Error.Code != -32603 {
+		t.Errorf("Expected -32603 Unauthorized, got %+v", resp.Error)
+	}
+	if resp.Error != nil && resp.Error.Message != "Unauthorized" {
+		t.Errorf("Expected 'Unauthorized' message, got %q", resp.Error.Message)
+	}
 }
