@@ -1,8 +1,9 @@
 steps:
   # Build Go binary
   - name: 'golang:1.22'
+    dir: 'relay-go'
     entrypoint: 'go'
-    args: ['build', '-o', 'relay-go/relay', './relay-go/']
+    args: ['build', '-o', 'relay', '.']
 
   # Build Docker image
   - name: 'gcr.io/cloud-builders/docker'
@@ -46,6 +47,11 @@ steps:
       - '0'
       - '--max-instances'
       - '10'
+      - '--update-env-vars'
+      - 'RELAY_JWT_SECRET=${_RELAY_JWT_SECRET}'
+
+substitutions:
+  _RELAY_JWT_SECRET: ''
 
 options:
   logging: CLOUD_LOGGING_ONLY
