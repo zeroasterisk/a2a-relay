@@ -1,4 +1,6 @@
 # A2A Relay
+[![CI](https://github.com/zeroasterisk/a2a-relay/actions/workflows/ci.yaml/badge.svg)](https://github.com/zeroasterisk/a2a-relay/actions/workflows/ci.yaml) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 
 > ⚠️ **Beta** — Tested and working, but API may change. Production use at your own risk.
 
