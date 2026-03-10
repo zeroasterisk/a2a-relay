@@ -8,7 +8,7 @@ ENV="${1:-dev}"
 SECRET="${RELAY_JWT_SECRET:?Set RELAY_JWT_SECRET environment variable}"
 
 if [[ "$ENV" == "prod" ]]; then
-  URL="https://a2a-relay-prod-442090395636.us-central1.run.app"
+  URL="https://a2a-relay-442090395636.us-central1.run.app"
   # Note: prod secret is different, must be set via env var
 else
   URL="https://a2a-relay-dev-442090395636.us-central1.run.app"
