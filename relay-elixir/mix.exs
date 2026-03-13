@@ -7,8 +7,18 @@ defmodule A2aRelay.MixProject do
       version: "0.1.0",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
+      releases: releases(),
       deps: deps(),
       elixirc_options: [warnings_as_errors: true]
+    ]
+  end
+
+  def releases do
+    [
+      a2a_relay: [
+        include_executables_for: [:unix],
+        applications: [runtime_tools: :permanent]
+      ]
     ]
   end
 

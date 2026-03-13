@@ -1,0 +1,52 @@
+steps:
+  # ── Build Docker image ──────────────────────────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--cache-from'
+      - 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}:latest'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}:latest'
+      - '-t'
+      - 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}:${_COMMIT_SHA}'
+      - '.'
+    id: 'docker-build'
+
+  # ── Push images ─────────────────────────────────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}']
+    id: 'docker-push'
+    waitFor: ['docker-build']
+
+  # ── Deploy to Cloud Run ─────────────────────────────────────────────────────
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image=gcr.io/${PROJECT_ID}/${_IMAGE_NAME}:${_COMMIT_SHA}'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--port=8080'
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--min-instances=0'
+      - '--max-instances=10'
+      - '--set-env-vars=MIX_ENV=prod'
+      - '--update-secrets=RELAY_JWT_SECRET=RELAY_JWT_SECRET_ELIXIR_DEV:latest'
+    id: 'cloud-run-deploy'
+    waitFor: ['docker-push']
+
+images:
+  - 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}:latest'
+  - 'gcr.io/${PROJECT_ID}/${_IMAGE_NAME}:${_COMMIT_SHA}'
+
+substitutions:
+  _COMMIT_SHA: 'unknown'
+  _SERVICE_NAME: 'a2a-relay-elixir-dev'
+  _IMAGE_NAME: 'a2a-relay-elixir'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
