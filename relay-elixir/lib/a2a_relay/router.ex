@@ -229,6 +229,72 @@ defmodule A2aRelay.Router do
     end
   end
 
+  # SSE streaming endpoint
+  post "/:tenant/:agent/message/stream" do
+    tenant = conn.path_params["tenant"]
+    agent = conn.path_params["agent"]
+
+    with {:ok, _client} <- authenticate_client(conn),
+         {:ok, method, params, _id} <- extract_jsonrpc(conn.body_params) do
+      case A2aRelay.AgentRegistry.lookup(tenant, agent) do
+        {:ok, %{pid: ws_pid}} ->
+          request_id = generate_request_id()
+
+          request = %{
+            "jsonrpc" => "2.0",
+            "id" => request_id,
+            "method" => method,
+            "params" => params,
+            "streaming" => true
+          }
+
+          # Register this process for streaming events
+          A2aRelay.StreamingRouter.register(request_id, self())
+
+          # Forward streaming request to agent
+          send(ws_pid, {:forward_request, request})
+
+          # Start chunked SSE response
+          conn =
+            conn
+            |> put_resp_header("content-type", "text/event-stream")
+            |> put_resp_header("cache-control", "no-cache")
+            |> put_resp_header("connection", "keep-alive")
+            |> send_chunked(200)
+
+          # Enter the SSE event loop
+          timeout_ms = A2aRelay.Config.request_timeout_ms()
+          result = stream_sse_loop(conn, request_id, timeout_ms)
+          A2aRelay.StreamingRouter.unregister(request_id)
+          result
+
+        :error ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(
+            404,
+            Jason.encode!(%{"error" => "agent not connected"})
+          )
+      end
+    else
+      {:error, :unauthorized} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, Jason.encode!(%{"error" => "unauthorized"}))
+
+      {:error, :invalid_jsonrpc} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(
+          400,
+          Jason.encode!(%{
+            "jsonrpc" => "2.0",
+            "error" => %{"code" => -32_600, "message" => "Invalid JSON-RPC request"}
+          })
+        )
+    end
+  end
+
   # JSON-RPC dispatch
   post "/:tenant/:agent/" do
     tenant = conn.path_params["tenant"]
@@ -363,6 +429,60 @@ defmodule A2aRelay.Router do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(200, Jason.encode!(response))
+  end
+
+  defp stream_sse_loop(conn, request_id, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_stream_sse(conn, request_id, deadline)
+  end
+
+  defp do_stream_sse(conn, request_id, deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      # Timeout — send error event and close
+      {:ok, conn} = chunk(conn, format_sse("stream_error", %{"error" => "timeout"}))
+      conn
+    else
+      receive do
+        {:stream_event, "stream_chunk", data} ->
+          case chunk(conn, format_sse("stream_chunk", data)) do
+            {:ok, conn} ->
+              do_stream_sse(conn, request_id, deadline)
+
+            {:error, _reason} ->
+              # Client disconnected
+              conn
+          end
+
+        {:stream_event, "stream_end", data} ->
+          {:ok, conn} = chunk(conn, format_sse("stream_end", data))
+          conn
+
+        {:stream_event, "stream_error", data} ->
+          {:ok, conn} = chunk(conn, format_sse("stream_error", data))
+          conn
+      after
+        min(remaining, 30_000) ->
+          # Send SSE comment as keepalive
+          case chunk(conn, ": keepalive\n\n") do
+            {:ok, conn} ->
+              do_stream_sse(conn, request_id, deadline)
+
+            {:error, _reason} ->
+              conn
+          end
+      end
+    end
+  end
+
+  defp format_sse(event_type, data) do
+    json = Jason.encode!(data)
+    "event: #{event_type}\ndata: #{json}\n\n"
+  end
+
+  defp generate_request_id do
+    :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
   end
 
   defp tenant_to_json(tenant) do

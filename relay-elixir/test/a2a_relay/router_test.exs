@@ -298,6 +298,127 @@ defmodule A2aRelay.RouterTest do
     end
   end
 
+  describe "POST /:tenant/:agent/message/stream" do
+    test "returns 404 when agent not connected" do
+      token = make_client_token("acme", "user-1")
+
+      body =
+        Jason.encode!(%{
+          "jsonrpc" => "2.0",
+          "method" => "message/stream",
+          "id" => "s-1",
+          "params" => %{"message" => %{"text" => "hello"}}
+        })
+
+      conn =
+        conn(:post, "/acme/ghost/message/stream", body)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 404
+      resp = Jason.decode!(conn.resp_body)
+      assert resp["error"] == "agent not connected"
+    end
+
+    test "returns 401 without auth" do
+      body =
+        Jason.encode!(%{
+          "jsonrpc" => "2.0",
+          "method" => "message/stream",
+          "id" => "s-2",
+          "params" => %{}
+        })
+
+      conn =
+        conn(:post, "/acme/bot/message/stream", body)
+        |> put_req_header("content-type", "application/json")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 401
+    end
+
+    test "returns 400 for invalid JSON-RPC" do
+      token = make_client_token("acme", "user-1")
+
+      body = Jason.encode!(%{"not" => "jsonrpc"})
+
+      conn =
+        conn(:post, "/acme/bot/message/stream", body)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("authorization", "Bearer #{token}")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 400
+    end
+
+    test "starts SSE stream and receives events when agent connected" do
+      # Register a fake agent that will send stream events back
+      card = %{"name" => "Stream Bot"}
+      AgentRegistry.register("acme", "streamer", self(), card)
+
+      token = make_client_token("acme", "user-1")
+
+      body =
+        Jason.encode!(%{
+          "jsonrpc" => "2.0",
+          "method" => "message/stream",
+          "id" => "s-3",
+          "params" => %{"message" => %{"text" => "hello"}}
+        })
+
+      # Run the streaming request in a separate process since it blocks
+      test_pid = self()
+
+      _caller =
+        spawn(fn ->
+          conn_result =
+            conn(:post, "/acme/streamer/message/stream", body)
+            |> put_req_header("content-type", "application/json")
+            |> put_req_header("authorization", "Bearer #{token}")
+            |> Router.call(Router.init([]))
+
+          send(test_pid, {:stream_done, conn_result})
+        end)
+
+      # Wait for the forwarded request to arrive at our "agent" process
+      assert_receive {:forward_request, request}, 2_000
+      assert request["streaming"] == true
+      request_id = request["id"]
+
+      # Simulate agent sending stream events
+      # Give the streaming router time to register
+      Process.sleep(50)
+
+      A2aRelay.StreamingRouter.route_event(request_id, "stream_chunk", %{
+        "type" => "stream_chunk",
+        "request_id" => request_id,
+        "content" => "Hello "
+      })
+
+      A2aRelay.StreamingRouter.route_event(request_id, "stream_chunk", %{
+        "type" => "stream_chunk",
+        "request_id" => request_id,
+        "content" => "World!"
+      })
+
+      A2aRelay.StreamingRouter.route_event(request_id, "stream_end", %{
+        "type" => "stream_end",
+        "request_id" => request_id
+      })
+
+      # The stream should complete after stream_end
+      assert_receive {:stream_done, result_conn}, 5_000
+      assert result_conn.status == 200
+
+      # Verify content-type header
+      {_, content_type} =
+        Enum.find(result_conn.resp_headers, fn {k, _} -> k == "content-type" end)
+
+      assert content_type == "text/event-stream"
+    end
+  end
+
   # Helpers
 
   defp make_client_token(tenant, user_id) do

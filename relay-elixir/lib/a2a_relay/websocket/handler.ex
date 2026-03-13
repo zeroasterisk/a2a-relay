@@ -44,6 +44,12 @@ defmodule A2aRelay.WebSocket.Handler do
   @impl WebSock
   def handle_in({text, [opcode: :text]}, %{authenticated: true} = state) do
     case Jason.decode(text) do
+      {:ok, %{"type" => type, "request_id" => request_id} = msg}
+      when type in ["stream_chunk", "stream_end", "stream_error"] ->
+        # Streaming event from the agent — route through StreamingRouter
+        A2aRelay.StreamingRouter.route_event(request_id, type, msg)
+        {:ok, state}
+
       {:ok, %{"id" => request_id} = response} ->
         # This is a response from the agent to a forwarded request
         A2aRelay.RequestRouter.handle_response(request_id, response)

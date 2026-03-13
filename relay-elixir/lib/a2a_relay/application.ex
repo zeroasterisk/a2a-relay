@@ -18,6 +18,7 @@ defmodule A2aRelay.Application do
       A2aRelay.TenantManager,
       A2aRelay.AgentRegistry,
       A2aRelay.RequestRouter,
+      A2aRelay.StreamingRouter,
       A2aRelay.Mailbox,
       A2aRelay.Cleanup,
       {Bandit, plug: A2aRelay.Router, port: A2aRelay.Config.port()}
