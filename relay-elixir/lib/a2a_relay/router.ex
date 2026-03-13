@@ -6,11 +6,18 @@ defmodule A2aRelay.Router do
   - `GET /health` — Health check
   - `GET /status` — Detailed relay status
   - `GET /ws/agent` — WebSocket upgrade for agent connections
+  - `GET /admin/tenants` — List all tenants
+  - `POST /admin/tenants` — Create a tenant
+  - `GET /admin/tenants/:id` — Tenant details + connected agents
+  - `DELETE /admin/tenants/:id` — Delete a tenant
+  - `GET /admin/agents` — All connected agents across tenants
   - `GET /:tenant/:agent/.well-known/agent.json` — Agent card discovery
   - `POST /:tenant/:agent/` — JSON-RPC dispatch to connected agents
   """
 
   use Plug.Router
+
+  require Logger
 
   plug Plug.Logger
   plug :match
@@ -30,6 +37,7 @@ defmodule A2aRelay.Router do
   get "/status" do
     count = A2aRelay.AgentRegistry.connected_count()
     pending = A2aRelay.RequestRouter.pending_count()
+    tenants = length(A2aRelay.TenantManager.list())
 
     conn
     |> put_resp_content_type("application/json")
@@ -39,7 +47,8 @@ defmodule A2aRelay.Router do
         "status" => "ok",
         "agents_connected" => count,
         "pending_requests" => pending,
-        "version" => "0.1.0"
+        "tenants" => tenants,
+        "version" => "0.2.0"
       })
     )
   end
@@ -49,6 +58,157 @@ defmodule A2aRelay.Router do
     conn
     |> WebSockAdapter.upgrade(A2aRelay.WebSocket.Handler, [], timeout: 60_000)
     |> halt()
+  end
+
+  # --- Admin endpoints ---
+
+  get "/admin/tenants" do
+    with :ok <- authenticate_admin(conn) do
+      tenants =
+        A2aRelay.TenantManager.list()
+        |> Enum.map(&tenant_to_json/1)
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, Jason.encode!(%{"tenants" => tenants}))
+    else
+      {:error, :unauthorized} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, Jason.encode!(%{"error" => "unauthorized"}))
+    end
+  end
+
+  post "/admin/tenants" do
+    with :ok <- authenticate_admin(conn) do
+      body = conn.body_params
+
+      tenant_id = Map.get(body, "id")
+      name = Map.get(body, "name", tenant_id)
+      jwt_secret = Map.get(body, "jwt_secret")
+
+      cond do
+        is_nil(tenant_id) or tenant_id == "" ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(400, Jason.encode!(%{"error" => "id is required"}))
+
+        true ->
+          opts = [name: name]
+          opts = if jwt_secret, do: Keyword.put(opts, :jwt_secret, jwt_secret), else: opts
+
+          case A2aRelay.TenantManager.register(tenant_id, opts) do
+            :ok ->
+              {:ok, tenant} = A2aRelay.TenantManager.lookup(tenant_id)
+
+              conn
+              |> put_resp_content_type("application/json")
+              |> send_resp(201, Jason.encode!(%{"tenant" => tenant_to_json(tenant)}))
+
+            {:error, :already_exists} ->
+              conn
+              |> put_resp_content_type("application/json")
+              |> send_resp(409, Jason.encode!(%{"error" => "tenant already exists"}))
+          end
+      end
+    else
+      {:error, :unauthorized} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, Jason.encode!(%{"error" => "unauthorized"}))
+    end
+  end
+
+  get "/admin/tenants/:id" do
+    with :ok <- authenticate_admin(conn) do
+      tenant_id = conn.path_params["id"]
+
+      case A2aRelay.TenantManager.lookup(tenant_id) do
+        {:ok, tenant} ->
+          agents =
+            A2aRelay.AgentRegistry.list_agents_with_meta(tenant_id)
+            |> Enum.map(fn {agent_id, entry} ->
+              %{
+                "agent_id" => agent_id,
+                "agent_card" => entry.agent_card,
+                "connected_at" => DateTime.to_iso8601(entry.connected_at)
+              }
+            end)
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(
+            200,
+            Jason.encode!(%{
+              "tenant" => tenant_to_json(tenant),
+              "agents" => agents
+            })
+          )
+
+        :error ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(404, Jason.encode!(%{"error" => "tenant not found"}))
+      end
+    else
+      {:error, :unauthorized} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, Jason.encode!(%{"error" => "unauthorized"}))
+    end
+  end
+
+  delete "/admin/tenants/:id" do
+    with :ok <- authenticate_admin(conn) do
+      tenant_id = conn.path_params["id"]
+
+      case A2aRelay.TenantManager.lookup(tenant_id) do
+        {:ok, _tenant} ->
+          A2aRelay.TenantManager.delete(tenant_id)
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, Jason.encode!(%{"deleted" => tenant_id}))
+
+        :error ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(404, Jason.encode!(%{"error" => "tenant not found"}))
+      end
+    else
+      {:error, :unauthorized} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, Jason.encode!(%{"error" => "unauthorized"}))
+    end
+  end
+
+  get "/admin/agents" do
+    with :ok <- authenticate_admin(conn) do
+      tenants = A2aRelay.TenantManager.list()
+
+      all_agents =
+        Enum.flat_map(tenants, fn tenant ->
+          A2aRelay.AgentRegistry.list_agents_with_meta(tenant.id)
+          |> Enum.map(fn {agent_id, entry} ->
+            %{
+              "tenant_id" => tenant.id,
+              "agent_id" => agent_id,
+              "agent_card" => entry.agent_card,
+              "connected_at" => DateTime.to_iso8601(entry.connected_at)
+            }
+          end)
+        end)
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, Jason.encode!(%{"agents" => all_agents}))
+    else
+      {:error, :unauthorized} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, Jason.encode!(%{"error" => "unauthorized"}))
+    end
   end
 
   # Agent card discovery
@@ -136,18 +296,52 @@ defmodule A2aRelay.Router do
 
   # Private helpers
 
-  defp authenticate_client(conn) do
-    case get_req_header(conn, "authorization") do
-      ["Bearer " <> token] ->
-        secret = A2aRelay.Config.jwt_secret()
+  defp authenticate_admin(conn) do
+    case A2aRelay.Config.admin_key() do
+      nil ->
+        # No admin key configured — open access
+        :ok
 
-        case A2aRelay.Auth.validate_client_token(token, secret) do
-          {:ok, client} -> {:ok, client}
-          {:error, _} -> {:error, :unauthorized}
+      expected_key ->
+        case get_req_header(conn, "x-admin-key") do
+          [^expected_key] -> :ok
+          _ -> {:error, :unauthorized}
         end
+    end
+  end
 
-      _ ->
-        {:error, :unauthorized}
+  defp authenticate_client(conn) do
+    if not A2aRelay.Config.auth_required() do
+      {:ok, %{tenant: "anonymous", user_id: "anonymous"}}
+    else
+      case get_req_header(conn, "authorization") do
+        ["Bearer " <> token] ->
+          # Try per-tenant secret first, then global fallback
+          tenant_id = conn.path_params["tenant"]
+          tenant_secret = A2aRelay.TenantManager.jwt_secret(tenant_id)
+          global_secret = A2aRelay.Config.jwt_secret()
+
+          secrets =
+            if tenant_secret do
+              [tenant_secret, global_secret]
+            else
+              [global_secret]
+            end
+
+          try_secrets(token, secrets)
+
+        _ ->
+          {:error, :unauthorized}
+      end
+    end
+  end
+
+  defp try_secrets(_token, []), do: {:error, :unauthorized}
+
+  defp try_secrets(token, [secret | rest]) do
+    case A2aRelay.Auth.validate_client_token(token, secret) do
+      {:ok, client} -> {:ok, client}
+      {:error, _} -> try_secrets(token, rest)
     end
   end
 
@@ -169,5 +363,14 @@ defmodule A2aRelay.Router do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(200, Jason.encode!(response))
+  end
+
+  defp tenant_to_json(tenant) do
+    %{
+      "id" => tenant.id,
+      "name" => tenant.name,
+      "enabled" => tenant.enabled,
+      "created_at" => DateTime.to_iso8601(tenant.created_at)
+    }
   end
 end

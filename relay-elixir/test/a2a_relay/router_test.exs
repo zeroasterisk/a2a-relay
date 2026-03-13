@@ -17,6 +17,24 @@ defmodule A2aRelay.RouterTest do
       :ets.delete_all_objects(:mailbox)
     end
 
+    # Clean tenants and re-add default
+    if :ets.whereis(:tenants) != :undefined do
+      :ets.delete_all_objects(:tenants)
+
+      default = %{
+        id: "default",
+        name: "Default Tenant",
+        jwt_secret: nil,
+        created_at: DateTime.utc_now(),
+        enabled: true
+      }
+
+      :ets.insert(:tenants, {"default", default})
+    end
+
+    # Ensure no admin key is set (open admin access for tests)
+    Application.put_env(:a2a_relay, :admin_key, nil)
+
     :ok
   end
 
@@ -34,7 +52,7 @@ defmodule A2aRelay.RouterTest do
   end
 
   describe "GET /status" do
-    test "returns detailed status" do
+    test "returns detailed status with tenants count" do
       conn =
         conn(:get, "/status")
         |> Router.call(Router.init([]))
@@ -44,7 +62,8 @@ defmodule A2aRelay.RouterTest do
       assert body["status"] == "ok"
       assert Map.has_key?(body, "agents_connected")
       assert Map.has_key?(body, "pending_requests")
-      assert body["version"] == "0.1.0"
+      assert Map.has_key?(body, "tenants")
+      assert body["version"] == "0.2.0"
     end
   end
 
@@ -123,6 +142,149 @@ defmodule A2aRelay.RouterTest do
         |> Router.call(Router.init([]))
 
       assert conn.status == 400
+    end
+  end
+
+  describe "GET /admin/tenants" do
+    test "lists all tenants" do
+      conn =
+        conn(:get, "/admin/tenants")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 200
+      body = Jason.decode!(conn.resp_body)
+      assert is_list(body["tenants"])
+      assert Enum.any?(body["tenants"], &(&1["id"] == "default"))
+    end
+
+    test "returns 401 when admin key is set but not provided" do
+      Application.put_env(:a2a_relay, :admin_key, "admin-secret")
+
+      conn =
+        conn(:get, "/admin/tenants")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 401
+    after
+      Application.put_env(:a2a_relay, :admin_key, nil)
+    end
+
+    test "returns 200 with correct admin key" do
+      Application.put_env(:a2a_relay, :admin_key, "admin-secret")
+
+      conn =
+        conn(:get, "/admin/tenants")
+        |> put_req_header("x-admin-key", "admin-secret")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 200
+    after
+      Application.put_env(:a2a_relay, :admin_key, nil)
+    end
+  end
+
+  describe "POST /admin/tenants" do
+    test "creates a new tenant" do
+      body = Jason.encode!(%{"id" => "new-tenant", "name" => "New Tenant"})
+
+      conn =
+        conn(:post, "/admin/tenants", body)
+        |> put_req_header("content-type", "application/json")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 201
+      resp = Jason.decode!(conn.resp_body)
+      assert resp["tenant"]["id"] == "new-tenant"
+      assert resp["tenant"]["name"] == "New Tenant"
+    end
+
+    test "returns 409 for duplicate tenant" do
+      body = Jason.encode!(%{"id" => "default"})
+
+      conn =
+        conn(:post, "/admin/tenants", body)
+        |> put_req_header("content-type", "application/json")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 409
+    end
+
+    test "returns 400 when id is missing" do
+      body = Jason.encode!(%{"name" => "No ID"})
+
+      conn =
+        conn(:post, "/admin/tenants", body)
+        |> put_req_header("content-type", "application/json")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 400
+    end
+  end
+
+  describe "GET /admin/tenants/:id" do
+    test "returns tenant details with connected agents" do
+      card = %{"name" => "Bot"}
+      AgentRegistry.register("default", "bot1", self(), card)
+
+      conn =
+        conn(:get, "/admin/tenants/default")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 200
+      resp = Jason.decode!(conn.resp_body)
+      assert resp["tenant"]["id"] == "default"
+      assert length(resp["agents"]) == 1
+      assert hd(resp["agents"])["agent_id"] == "bot1"
+    end
+
+    test "returns 404 for unknown tenant" do
+      conn =
+        conn(:get, "/admin/tenants/nonexistent")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 404
+    end
+  end
+
+  describe "DELETE /admin/tenants/:id" do
+    test "deletes existing tenant" do
+      A2aRelay.TenantManager.register("to-delete")
+
+      conn =
+        conn(:delete, "/admin/tenants/to-delete")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 200
+      resp = Jason.decode!(conn.resp_body)
+      assert resp["deleted"] == "to-delete"
+      assert :error = A2aRelay.TenantManager.lookup("to-delete")
+    end
+
+    test "returns 404 for unknown tenant" do
+      conn =
+        conn(:delete, "/admin/tenants/ghost")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 404
+    end
+  end
+
+  describe "GET /admin/agents" do
+    test "lists agents across all tenants" do
+      A2aRelay.TenantManager.register("t1")
+      AgentRegistry.register("default", "a1", self(), %{"name" => "A1"})
+      AgentRegistry.register("t1", "a2", self(), %{"name" => "A2"})
+
+      conn =
+        conn(:get, "/admin/agents")
+        |> Router.call(Router.init([]))
+
+      assert conn.status == 200
+      resp = Jason.decode!(conn.resp_body)
+      assert length(resp["agents"]) == 2
+
+      tenant_ids = Enum.map(resp["agents"], & &1["tenant_id"]) |> Enum.sort()
+      assert tenant_ids == ["default", "t1"]
     end
   end
 

@@ -37,4 +37,12 @@ defmodule A2aRelay.Config do
   @doc "Interval in ms between WebSocket ping frames."
   @spec ws_ping_interval_ms() :: non_neg_integer()
   def ws_ping_interval_ms, do: Application.get_env(:a2a_relay, :ws_ping_interval_ms, 20_000)
+
+  @doc "Admin API key for protected endpoints. `nil` means admin endpoints are open."
+  @spec admin_key() :: String.t() | nil
+  def admin_key, do: Application.get_env(:a2a_relay, :admin_key, nil)
+
+  @doc "Whether JWT authentication is required for client requests."
+  @spec auth_required() :: boolean()
+  def auth_required, do: Application.get_env(:a2a_relay, :auth_required, true)
 end

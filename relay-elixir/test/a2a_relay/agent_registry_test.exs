@@ -89,4 +89,74 @@ defmodule A2aRelay.AgentRegistryTest do
       assert :error = AgentRegistry.lookup("t1", "a1")
     end
   end
+
+  describe "list_agents_with_meta/1" do
+    test "returns full entries with agent IDs" do
+      AgentRegistry.register("t1", "a1", self(), %{"name" => "Agent 1"})
+      AgentRegistry.register("t1", "a2", self(), %{"name" => "Agent 2"})
+      AgentRegistry.register("t2", "a3", self(), %{"name" => "Other"})
+
+      entries = AgentRegistry.list_agents_with_meta("t1")
+      assert length(entries) == 2
+
+      ids = Enum.map(entries, fn {agent_id, _entry} -> agent_id end) |> Enum.sort()
+      assert ids == ["a1", "a2"]
+
+      {_id, entry} = Enum.find(entries, fn {id, _} -> id == "a1" end)
+      assert entry.agent_card == %{"name" => "Agent 1"}
+      assert entry.pid == self()
+      assert %DateTime{} = entry.connected_at
+    end
+
+    test "returns empty list for tenant with no agents" do
+      assert [] = AgentRegistry.list_agents_with_meta("empty")
+    end
+  end
+
+  describe "presence subscriptions" do
+    test "subscribe receives :connected event on register" do
+      AgentRegistry.subscribe("t1")
+
+      {:ok, pid} = Agent.start(fn -> :ok end)
+      AgentRegistry.register("t1", "a1", pid, %{})
+
+      assert_receive {:agent_presence, "t1", "a1", :connected}, 500
+    end
+
+    test "subscribe receives :disconnected event on unregister" do
+      AgentRegistry.subscribe("t1")
+
+      AgentRegistry.register("t1", "a1", self(), %{})
+      assert_receive {:agent_presence, "t1", "a1", :connected}, 500
+
+      AgentRegistry.unregister("t1", "a1")
+      assert_receive {:agent_presence, "t1", "a1", :disconnected}, 500
+    end
+
+    test "subscribe receives :disconnected on process death" do
+      AgentRegistry.subscribe("t1")
+
+      {:ok, pid} = Agent.start(fn -> :ok end)
+      AgentRegistry.register("t1", "a1", pid, %{})
+      assert_receive {:agent_presence, "t1", "a1", :connected}, 500
+
+      Agent.stop(pid)
+      assert_receive {:agent_presence, "t1", "a1", :disconnected}, 500
+    end
+
+    test "does not receive events for other tenants" do
+      AgentRegistry.subscribe("t1")
+      AgentRegistry.register("t2", "a1", self(), %{})
+
+      refute_receive {:agent_presence, _, _, _}, 100
+    end
+
+    test "unsubscribe stops events" do
+      AgentRegistry.subscribe("t1")
+      AgentRegistry.unsubscribe("t1")
+
+      AgentRegistry.register("t1", "a1", self(), %{})
+      refute_receive {:agent_presence, _, _, _}, 100
+    end
+  end
 end

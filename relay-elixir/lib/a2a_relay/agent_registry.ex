@@ -28,6 +28,23 @@ defmodule A2aRelay.AgentRegistry do
   end
 
   @doc """
+  Subscribes the calling process to presence events for a tenant.
+
+  The subscriber will receive messages of the form:
+  `{:agent_presence, tenant_id, agent_id, :connected | :disconnected}`
+  """
+  @spec subscribe(String.t()) :: :ok
+  def subscribe(tenant_id) do
+    GenServer.call(__MODULE__, {:subscribe, tenant_id, self()})
+  end
+
+  @doc "Unsubscribes the calling process from presence events for a tenant."
+  @spec unsubscribe(String.t()) :: :ok
+  def unsubscribe(tenant_id) do
+    GenServer.call(__MODULE__, {:unsubscribe, tenant_id, self()})
+  end
+
+  @doc """
   Registers an agent in the registry.
 
   If an agent with the same `{tenant_id, agent_id}` is already registered,
@@ -66,6 +83,17 @@ defmodule A2aRelay.AgentRegistry do
     |> Enum.map(& &1.agent_card)
   end
 
+  @doc """
+  Lists all agent entries (full metadata) for a given tenant.
+
+  Returns a list of `{agent_id, agent_entry}` tuples including pid,
+  agent_card, connected_at, and last_ping.
+  """
+  @spec list_agents_with_meta(String.t()) :: [{String.t(), agent_entry()}]
+  def list_agents_with_meta(tenant_id) do
+    :ets.select(@table, [{{{tenant_id, :"$1"}, :"$2"}, [], [{{:"$1", :"$2"}}]}])
+  end
+
   @doc "Returns the total number of connected agents."
   @spec connected_count() :: non_neg_integer()
   def connected_count do
@@ -77,7 +105,7 @@ defmodule A2aRelay.AgentRegistry do
   @impl true
   def init(_opts) do
     table = :ets.new(@table, [:named_table, :set, :public, read_concurrency: true])
-    {:ok, %{table: table, monitors: %{}}}
+    {:ok, %{table: table, monitors: %{}, presence_subscribers: %{}}}
   end
 
   @impl true
@@ -101,6 +129,7 @@ defmodule A2aRelay.AgentRegistry do
 
     monitors = Map.put(state.monitors, ref, key)
     Logger.info("Agent registered: #{tenant_id}/#{agent_id} (pid: #{inspect(pid)})")
+    broadcast_presence(state, tenant_id, agent_id, :connected)
 
     {:reply, :ok, %{state | monitors: monitors}}
   end
@@ -111,7 +140,37 @@ defmodule A2aRelay.AgentRegistry do
     :ets.delete(@table, key)
     state = maybe_demonitor(state, key)
     Logger.info("Agent unregistered: #{tenant_id}/#{agent_id}")
+    broadcast_presence(state, tenant_id, agent_id, :disconnected)
     {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:subscribe, tenant_id, pid}, _from, state) do
+    subs = Map.get(state.presence_subscribers, tenant_id, [])
+
+    updated =
+      if pid in subs do
+        subs
+      else
+        [pid | subs]
+      end
+
+    {:reply, :ok, %{state | presence_subscribers: Map.put(state.presence_subscribers, tenant_id, updated)}}
+  end
+
+  @impl true
+  def handle_call({:unsubscribe, tenant_id, pid}, _from, state) do
+    subs = Map.get(state.presence_subscribers, tenant_id, [])
+    updated = List.delete(subs, pid)
+
+    new_subscribers =
+      if updated == [] do
+        Map.delete(state.presence_subscribers, tenant_id)
+      else
+        Map.put(state.presence_subscribers, tenant_id, updated)
+      end
+
+    {:reply, :ok, %{state | presence_subscribers: new_subscribers}}
   end
 
   @impl true
@@ -120,7 +179,9 @@ defmodule A2aRelay.AgentRegistry do
       {{tenant_id, agent_id}, monitors} ->
         :ets.delete(@table, {tenant_id, agent_id})
         Logger.info("Agent disconnected (process down): #{tenant_id}/#{agent_id}")
-        {:noreply, %{state | monitors: monitors}}
+        new_state = %{state | monitors: monitors}
+        broadcast_presence(new_state, tenant_id, agent_id, :disconnected)
+        {:noreply, new_state}
 
       {nil, _monitors} ->
         {:noreply, state}
@@ -128,6 +189,14 @@ defmodule A2aRelay.AgentRegistry do
   end
 
   # Private helpers
+
+  defp broadcast_presence(state, tenant_id, agent_id, event) do
+    subs = Map.get(state.presence_subscribers, tenant_id, [])
+
+    Enum.each(subs, fn pid ->
+      send(pid, {:agent_presence, tenant_id, agent_id, event})
+    end)
+  end
 
   defp maybe_demonitor(state, key) do
     case Enum.find(state.monitors, fn {_ref, k} -> k == key end) do

@@ -15,6 +15,7 @@ defmodule A2aRelay.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      A2aRelay.TenantManager,
       A2aRelay.AgentRegistry,
       A2aRelay.RequestRouter,
       A2aRelay.Mailbox,
