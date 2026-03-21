@@ -406,9 +406,10 @@ func (r *Relay) SendRequest(agent *ConnectedAgent, method string, params json.Ra
 	}
 
 	agent.mu.Lock()
-	err := agent.Conn.WriteJSON(map[string]interface{}{
-		"type":    "a2a.request",
-		"payload": req,
+	reqBytes, _ := json.Marshal(req)
+	err := agent.Conn.WriteJSON(WSMessage{
+		Type:    "a2a.request",
+		Payload: reqBytes,
 	})
 	agent.mu.Unlock()
 
@@ -490,13 +491,13 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 	conn.SetReadDeadline(time.Now().Add(*authTimeout))
 	if err := conn.ReadJSON(&authMsg); err != nil {
 		log.Printf("[RELAY] Auth read failed: %v", err)
-		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "auth required"})
+		conn.WriteJSON(WSError{Type: "error", Message: "auth required"})
 		return
 	}
 	conn.SetReadDeadline(time.Time{}) // Clear deadline for normal operation
 
 	if authMsg.Type != "auth" {
-		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "expected auth message"})
+		conn.WriteJSON(WSError{Type: "error", Message: "expected auth message"})
 		return
 	}
 
@@ -504,7 +505,7 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 	claims, err := r.ValidateToken(authMsg.Token)
 	if err != nil {
 		log.Printf("[RELAY] Auth failed: %v", err)
-		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "invalid token"})
+		conn.WriteJSON(WSError{Type: "error", Message: "invalid token"})
 		return
 	}
 
@@ -513,12 +514,12 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 	agentID, _ := claims["agent_id"].(string)
 	if agentID == "" {
 		log.Printf("[RELAY] Auth rejected: token missing agent_id claim")
-		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "token missing required agent_id claim"})
+		conn.WriteJSON(WSError{Type: "error", Message: "token missing required agent_id claim"})
 		return
 	}
 
 	if tenantID == "" {
-		conn.WriteJSON(map[string]interface{}{"type": "error", "message": "missing tenant in token"})
+		conn.WriteJSON(WSError{Type: "error", Message: "missing tenant in token"})
 		return
 	}
 
@@ -527,10 +528,10 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 	defer r.UnregisterAgent(tenantID, agentID)
 
 	// Send auth success
-	conn.WriteJSON(map[string]interface{}{
-		"type":     "auth_ok",
-		"agent_id": agentID,
-		"tenant":   tenantID,
+	conn.WriteJSON(WSAuthOK{
+		Type:    "auth_ok",
+		AgentID: agentID,
+		Tenant:  tenantID,
 	})
 
 	// Configure WebSocket keepalive for Cloud Run
@@ -570,7 +571,7 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 
 	// Read loop - handle responses and pings
 	for {
-		var msg map[string]json.RawMessage
+		var msg WSMessage
 		if err := conn.ReadJSON(&msg); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("[RELAY] Agent %s read error: %v", agentID, err)
@@ -581,20 +582,15 @@ func (r *Relay) handleAgentWebSocket(w http.ResponseWriter, req *http.Request) {
 		// Refresh read deadline on any message
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 
-		msgType := ""
-		if t, ok := msg["type"]; ok {
-			json.Unmarshal(t, &msgType)
-		}
-
-		switch msgType {
+		switch msg.Type {
 		case "a2a.response":
 			var resp A2AResponse
-			if payload, ok := msg["payload"]; ok {
-				json.Unmarshal(payload, &resp)
+			if len(msg.Payload) > 0 {
+				json.Unmarshal(msg.Payload, &resp)
 				r.HandleAgentResponse(&resp)
 			}
 		case "ping":
-			conn.WriteJSON(map[string]string{"type": "pong"})
+			conn.WriteJSON(WSPong{Type: "pong"})
 		}
 	}
 }
@@ -658,10 +654,10 @@ func (r *Relay) handleA2ARequest(w http.ResponseWriter, req *http.Request) {
 		}
 		// No response within sync wait — return 202 with task_id
 		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "queued",
-			"task_id": msg.ID,
-			"message": "Agent is offline. Message queued for delivery.",
+		json.NewEncoder(w).Encode(RelayQueuedResponse{
+			Status:  "queued",
+			TaskID:  msg.ID,
+			Message: "Agent is offline. Message queued for delivery.",
 		})
 		return
 	}
@@ -826,9 +822,10 @@ func (r *Relay) handleJSONRPC(w http.ResponseWriter, req *http.Request) {
 		}
 		// No response — return queued status
 		w.WriteHeader(http.StatusAccepted)
-		resultJSON, _ := json.Marshal(map[string]interface{}{
-			"status": "queued", "task_id": msg.ID,
-			"message": "Agent is offline. Message queued for delivery.",
+		resultJSON, _ := json.Marshal(RelayQueuedResponse{
+			Status:  "queued",
+			TaskID:  msg.ID,
+			Message: "Agent is offline. Message queued for delivery.",
 		})
 		json.NewEncoder(w).Encode(&JSONRPCResponse{JSONRPC: "2.0", ID: rpcReq.ID, Result: resultJSON})
 		return
@@ -1077,15 +1074,15 @@ func (r *Relay) handleListAgents(w http.ResponseWriter, req *http.Request) {
 	}
 
 	agents := r.ListAgents(tenantID)
-	result := make([]map[string]interface{}, 0, len(agents))
+	result := make([]RelayAgentInfo, 0, len(agents))
 	for _, a := range agents {
-		entry := map[string]interface{}{
-			"id":           a.ID,
-			"connected_at": a.ConnectedAt,
+		entry := RelayAgentInfo{
+			ID:          a.ID,
+			ConnectedAt: a.ConnectedAt,
 		}
 		if a.AgentCard != nil {
-			entry["name"] = a.AgentCard.Name
-			entry["description"] = a.AgentCard.Description
+			entry.Name = a.AgentCard.Name
+			entry.Description = a.AgentCard.Description
 		}
 		result = append(result, entry)
 	}
@@ -1127,10 +1124,10 @@ func (r *Relay) handleTaskPoll(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	if ok {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":   "completed",
-			"task_id":  tr.ID,
-			"response": tr.Response,
+		json.NewEncoder(w).Encode(RelayTaskPollResponse{
+			Status:   "completed",
+			TaskID:   tr.ID,
+			Response: tr.Response,
 		})
 		return
 	}
@@ -1143,9 +1140,9 @@ func (r *Relay) handleTaskPoll(w http.ResponseWriter, req *http.Request) {
 			if msg.ID == taskID {
 				mb.mu.Unlock()
 				r.mu.RUnlock()
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"status":  "queued",
-					"task_id": taskID,
+				json.NewEncoder(w).Encode(RelayTaskPollResponse{
+					Status:  "queued",
+					TaskID:  taskID,
 				})
 				return
 			}
@@ -1171,13 +1168,13 @@ func (r *Relay) handleHealth(w http.ResponseWriter, req *http.Request) {
 	r.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":            "ok",
-		"version":           "0.2.0",
-		"agents_connected":  agentCount,
-		"pending_requests":  pendingCount,
-		"queued_messages":   queuedCount,
-		"completed_tasks":   taskCount,
+	json.NewEncoder(w).Encode(RelayHealthResponse{
+		Status:          "ok",
+		Version:         "0.2.0",
+		AgentsConnected: agentCount,
+		PendingRequests: pendingCount,
+		QueuedMessages:  queuedCount,
+		CompletedTasks:  taskCount,
 	})
 }
 
@@ -1188,12 +1185,12 @@ func (r *Relay) handleRoot(w http.ResponseWriter, req *http.Request) {
 	token, ok := extractBearerToken(req.Header.Get("Authorization"))
 	if !ok {
 		// Return basic info without agent list for unauthenticated requests
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"name":    "A2A Relay",
-			"version": "0.2.0",
-			"docs":    "https://github.com/zeroasterisk/a2a-relay",
-			"message": "Authenticate with Bearer token to see agents",
-			"endpoints": map[string]string{
+		json.NewEncoder(w).Encode(RelayInfoResponse{
+			Name:    "A2A Relay",
+			Version: "0.2.0",
+			Docs:    "https://github.com/zeroasterisk/a2a-relay",
+			Message: "Authenticate with Bearer token to see agents",
+			Endpoints: map[string]string{
 				"health":     "GET /health",
 				"agent_ws":   "WS /agent",
 				"agent_card": "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
@@ -1214,41 +1211,35 @@ func (r *Relay) handleRoot(w http.ResponseWriter, req *http.Request) {
 
 	// Only show agents for the caller's tenant
 	r.mu.RLock()
-	agents := make([]map[string]interface{}, 0)
+	agents := make([]RelayAgentInfo, 0)
 	for _, a := range r.agents {
 		if a.TenantID != callerTenant {
 			continue
 		}
-		entry := map[string]interface{}{
-			"id":      a.ID,
-			"cardUrl": fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
-			"url":     fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
+		entry := RelayAgentInfo{
+			ID:      a.ID,
+			CardURL: fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
+			URL:     fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
 		}
 		if a.AgentCard != nil {
-			entry["name"] = a.AgentCard.Name
-			entry["description"] = a.AgentCard.Description
+			entry.Name = a.AgentCard.Name
+			entry.Description = a.AgentCard.Description
+			// RelayAgentInfo.Skills is []AgentSkill, so we can just assign it
 			if len(a.AgentCard.Skills) > 0 {
-				skills := make([]map[string]string, 0, len(a.AgentCard.Skills))
-				for _, s := range a.AgentCard.Skills {
-					skills = append(skills, map[string]string{
-						"id":   s.ID,
-						"name": s.Name,
-					})
-				}
-				entry["skills"] = skills
+				entry.Skills = a.AgentCard.Skills
 			}
 		}
 		agents = append(agents, entry)
 	}
 	r.mu.RUnlock()
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"name":    "A2A Relay",
-		"version": "0.2.0",
-		"docs":    "https://github.com/zeroasterisk/a2a-relay",
-		"tenant":  callerTenant,
-		"agents":  agents,
-		"endpoints": map[string]string{
+	json.NewEncoder(w).Encode(RelayInfoResponse{
+		Name:    "A2A Relay",
+		Version: "0.2.0",
+		Docs:    "https://github.com/zeroasterisk/a2a-relay",
+		Tenant:  callerTenant,
+		Agents:  agents,
+		Endpoints: map[string]string{
 			"health":     "GET /health",
 			"agent_ws":   "WS /agent",
 			"agent_card": "GET /t/{tenant}/a2a/{agent}/.well-known/agent.json",
@@ -1278,29 +1269,29 @@ func (r *Relay) handleAgentIndex(w http.ResponseWriter, req *http.Request) {
 	callerTenant, _ := claims["tenant"].(string)
 
 	r.mu.RLock()
-	agents := make([]map[string]interface{}, 0)
+	agents := make([]RelayAgentInfo, 0)
 	for _, a := range r.agents {
 		if a.TenantID != callerTenant {
 			continue
 		}
-		entry := map[string]interface{}{
-			"id":      a.ID,
-			"cardUrl": fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
-			"url":     fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
+		entry := RelayAgentInfo{
+			ID:      a.ID,
+			CardURL: fmt.Sprintf("https://%s/t/%s/a2a/%s/.well-known/agent.json", req.Host, a.TenantID, a.ID),
+			URL:     fmt.Sprintf("https://%s/t/%s/a2a/%s/", req.Host, a.TenantID, a.ID),
 		}
 		if a.AgentCard != nil {
-			entry["name"] = a.AgentCard.Name
-			entry["description"] = a.AgentCard.Description
-			entry["skills"] = a.AgentCard.Skills
-			entry["capabilities"] = a.AgentCard.Capabilities
+			entry.Name = a.AgentCard.Name
+			entry.Description = a.AgentCard.Description
+			entry.Skills = a.AgentCard.Skills
+			entry.Capabilities = a.AgentCard.Capabilities
 		}
 		agents = append(agents, entry)
 	}
 	r.mu.RUnlock()
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"agents": agents,
-		"count":  len(agents),
+	json.NewEncoder(w).Encode(RelayAgentIndexResponse{
+		Agents: agents,
+		Count:  len(agents),
 	})
 }
 
