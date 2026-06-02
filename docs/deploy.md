@@ -355,7 +355,7 @@ curl https://your-relay.example.com/health
 
 # Send a test message (requires client JWT)
 curl -X POST https://your-relay.example.com/t/my-tenant/a2a/my-agent/message/send \
-  -H "Authorization: Bearer $CLIENT_TOKEN" \
+  -H "Authorization: Bearer <YOUR_CLIENT_JWT_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{"message": {"role": "user", "parts": [{"text": "Hello!"}]}}'
 ```
