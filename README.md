@@ -1,4 +1,7 @@
 # A2A Relay
+
+> **⚠️ Personal Hobby Project** — This is an independent, personal project by [Alan Blount](https://github.com/zeroasterisk). It is **not affiliated with, endorsed by, or supported by any employer, company, or organization**. No warranty; use at your own risk.
+
 [![CI](https://github.com/zeroasterisk/a2a-relay/actions/workflows/ci.yaml/badge.svg)](https://github.com/zeroasterisk/a2a-relay/actions/workflows/ci.yaml) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 
